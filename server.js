@@ -58,27 +58,78 @@ function cleanPhoneFromJid(jid) {
     .replace(/\D/g, "");
 }
 
+function unwrapMessage(message) {
+  if (!message) return null;
+
+  if (message.ephemeralMessage?.message) {
+    return unwrapMessage(message.ephemeralMessage.message);
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return unwrapMessage(message.viewOnceMessage.message);
+  }
+
+  if (message.viewOnceMessageV2?.message) {
+    return unwrapMessage(message.viewOnceMessageV2.message);
+  }
+
+  if (message.viewOnceMessageV2Extension?.message) {
+    return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  }
+
+  if (message.documentWithCaptionMessage?.message) {
+    return unwrapMessage(message.documentWithCaptionMessage.message);
+  }
+
+  if (message.editedMessage?.message) {
+    return unwrapMessage(message.editedMessage.message);
+  }
+
+  return message;
+}
+
 function extractMessageText(message) {
+  const cleanMessage = unwrapMessage(message);
+
   return (
-    message?.conversation ||
-    message?.extendedTextMessage?.text ||
-    message?.imageMessage?.caption ||
-    message?.videoMessage?.caption ||
-    message?.documentMessage?.caption ||
+    cleanMessage?.conversation ||
+    cleanMessage?.extendedTextMessage?.text ||
+    cleanMessage?.imageMessage?.caption ||
+    cleanMessage?.videoMessage?.caption ||
+    cleanMessage?.documentMessage?.caption ||
+    cleanMessage?.buttonsResponseMessage?.selectedDisplayText ||
+    cleanMessage?.listResponseMessage?.title ||
+    cleanMessage?.listResponseMessage?.description ||
+    cleanMessage?.templateButtonReplyMessage?.selectedDisplayText ||
+    cleanMessage?.pollCreationMessage?.name ||
+    cleanMessage?.pollCreationMessageV3?.name ||
     ""
   );
 }
 
 function extractMessageType(message) {
-  if (message?.conversation) return "text";
-  if (message?.extendedTextMessage) return "text";
-  if (message?.imageMessage) return "image";
-  if (message?.videoMessage) return "video";
-  if (message?.audioMessage) return "audio";
-  if (message?.documentMessage) return "document";
-  if (message?.stickerMessage) return "sticker";
-  if (message?.locationMessage) return "location";
-  if (message?.contactMessage) return "contact";
+  const cleanMessage = unwrapMessage(message);
+
+  if (cleanMessage?.conversation) return "text";
+  if (cleanMessage?.extendedTextMessage) return "text";
+  if (cleanMessage?.imageMessage) return "image";
+  if (cleanMessage?.videoMessage) return "video";
+  if (cleanMessage?.audioMessage) return "audio";
+  if (cleanMessage?.documentMessage) return "document";
+  if (cleanMessage?.stickerMessage) return "sticker";
+  if (cleanMessage?.locationMessage) return "location";
+  if (cleanMessage?.liveLocationMessage) return "location";
+  if (cleanMessage?.contactMessage) return "contact";
+  if (cleanMessage?.contactsArrayMessage) return "contact";
+  if (cleanMessage?.buttonsResponseMessage) return "button_response";
+  if (cleanMessage?.listResponseMessage) return "list_response";
+  if (cleanMessage?.templateButtonReplyMessage) return "button_response";
+  if (cleanMessage?.pollCreationMessage) return "poll";
+  if (cleanMessage?.pollCreationMessageV3) return "poll";
+  if (cleanMessage?.protocolMessage) return "protocol";
+  if (cleanMessage?.reactionMessage) return "reaction";
+  if (cleanMessage?.messageContextInfo) return "context";
+
   return "unknown";
 }
 
@@ -202,28 +253,28 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
 
       if (!remoteJid) continue;
 
-      // Ignora grupos neste MVP
       if (remoteJid.includes("@g.us")) {
         console.log("Mensagem de grupo ignorada:", remoteJid);
         continue;
       }
 
-      // Ignora status/broadcast
       if (remoteJid === "status@broadcast") {
         continue;
       }
 
       const contactPhone = cleanPhoneFromJid(remoteJid);
-      const messageText = extractMessageText(msg.message);
-      const messageType = extractMessageType(msg.message);
+      const cleanMessage = unwrapMessage(msg.message);
+      const messageText = extractMessageText(cleanMessage);
+      const messageType = extractMessageType(cleanMessage);
 
-      // Para o MVP, ignora eventos sem texto/mídia relevante
-      if (!messageText && messageType === "unknown") {
+      if (!messageText && ["unknown", "protocol", "reaction", "context"].includes(messageType)) {
         console.log("Mensagem ignorada sem conteúdo útil:", {
           sessionId,
           remoteJid,
+          fromMe,
           messageId,
-          messageType
+          messageType,
+          rawKeys: cleanMessage ? Object.keys(cleanMessage) : []
         });
         continue;
       }
