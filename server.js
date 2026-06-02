@@ -45,17 +45,88 @@ function checkSecret(req, res, next) {
   next();
 }
 
-function normalizePhone(phone) {
-  return phone.includes("@s.whatsapp.net")
-    ? phone
-    : `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+function normalizePhoneToJid(phone) {
+  const value = String(phone || "").trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (value.endsWith("@lid")) {
+    return null;
+  }
+
+  if (value.endsWith("@s.whatsapp.net")) {
+    return value;
+  }
+
+  const digits = value.replace(/\D/g, "");
+
+  if (!digits) {
+    return null;
+  }
+
+  return `${digits}@s.whatsapp.net`;
 }
 
 function cleanPhoneFromJid(jid) {
-  return jid
+  return String(jid || "")
     .replace("@s.whatsapp.net", "")
     .replace("@c.us", "")
     .replace(/\D/g, "");
+}
+
+function getContactIdentity(remoteJid, msg = {}) {
+  const cleanJid = String(remoteJid || "").trim();
+
+  const possibleJids = [
+    cleanJid,
+    msg?.key?.participant,
+    msg?.participant,
+    msg?.message?.senderKeyDistributionMessage?.groupId
+  ].filter(Boolean);
+
+  const phoneJid = possibleJids.find((jid) =>
+    String(jid).endsWith("@s.whatsapp.net")
+  );
+
+  if (phoneJid) {
+    const phone = cleanPhoneFromJid(phoneJid);
+
+    return {
+      contact_phone: phone || null,
+      contact_jid: phoneJid,
+      contact_lid: null
+    };
+  }
+
+  if (cleanJid.endsWith("@lid")) {
+    const lid = cleanJid.replace("@lid", "").replace(/\D/g, "");
+
+    return {
+      contact_phone: null,
+      contact_jid: cleanJid,
+      contact_lid: lid || null
+    };
+  }
+
+  if (cleanJid.endsWith("@s.whatsapp.net")) {
+    const phone = cleanPhoneFromJid(cleanJid);
+
+    return {
+      contact_phone: phone || null,
+      contact_jid: cleanJid,
+      contact_lid: null
+    };
+  }
+
+  const fallbackDigits = cleanJid.replace(/\D/g, "");
+
+  return {
+    contact_phone: fallbackDigits || null,
+    contact_jid: cleanJid || null,
+    contact_lid: null
+  };
 }
 
 function unwrapMessage(message) {
@@ -262,7 +333,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         continue;
       }
 
-      const contactPhone = cleanPhoneFromJid(remoteJid);
+      const contactIdentity = getContactIdentity(remoteJid, msg);
       const cleanMessage = unwrapMessage(msg.message);
       const messageText = extractMessageText(cleanMessage);
       const messageType = extractMessageType(cleanMessage);
@@ -274,6 +345,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
           fromMe,
           messageId,
           messageType,
+          contactIdentity,
           rawKeys: cleanMessage ? Object.keys(cleanMessage) : []
         });
         continue;
@@ -282,7 +354,9 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       const payload = {
         store_id: storeId,
         session_id: sessionId,
-        contact_phone: contactPhone,
+        contact_phone: contactIdentity.contact_phone,
+        contact_jid: contactIdentity.contact_jid,
+        contact_lid: contactIdentity.contact_lid,
         contact_name: msg.pushName || null,
         message_id: messageId,
         from_me: fromMe,
@@ -295,7 +369,9 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       console.log("Mensagem processada:", {
         sessionId,
         storeId,
-        contactPhone,
+        contactPhone: contactIdentity.contact_phone,
+        contactJid: contactIdentity.contact_jid,
+        contactLid: contactIdentity.contact_lid,
         fromMe,
         messageText,
         messageType,
@@ -559,11 +635,11 @@ app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
 });
 
 app.post("/messages/send", checkSecret, async (req, res) => {
-  const { session_id, phone, message } = req.body;
+  const { session_id, phone, contact_jid, message } = req.body;
 
-  if (!session_id || !phone || !message) {
+  if (!session_id || !message || (!phone && !contact_jid)) {
     return res.status(400).json({
-      error: "session_id, phone e message são obrigatórios"
+      error: "session_id, message e phone ou contact_jid são obrigatórios"
     });
   }
 
@@ -576,7 +652,23 @@ app.post("/messages/send", checkSecret, async (req, res) => {
   }
 
   try {
-    const jid = normalizePhone(phone);
+    const preferredDestination = phone || contact_jid;
+
+    if (String(preferredDestination).endsWith("@lid")) {
+      return res.status(400).json({
+        error: "Não é possível enviar mensagem para @lid. Use o telefone real do contato.",
+        code: "cannot_send_to_lid"
+      });
+    }
+
+    const jid = normalizePhoneToJid(preferredDestination);
+
+    if (!jid) {
+      return res.status(400).json({
+        error: "Destino inválido. Informe um telefone real ou um JID @s.whatsapp.net.",
+        code: "invalid_destination"
+      });
+    }
 
     const result = await sessionData.sock.sendMessage(jid, {
       text: message
@@ -585,6 +677,7 @@ app.post("/messages/send", checkSecret, async (req, res) => {
     console.log("Mensagem enviada pelo endpoint:", {
       session_id,
       phone,
+      contact_jid,
       jid,
       message,
       result
