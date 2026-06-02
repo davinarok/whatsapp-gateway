@@ -109,13 +109,19 @@ app.post("/sessions", checkSecret, async (req, res) => {
       }
 
       if (connection === "close") {
-  const shouldReconnect =
-    lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+  const statusCode = lastDisconnect?.error?.output?.statusCode;
+  const errorMessage = lastDisconnect?.error?.message;
+  const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
   sessionData.status = shouldReconnect ? "desconectado" : "deslogado";
   sessionData.qrCode = null;
 
-  console.log(`Sessão ${sessionId} fechada. Reconectar: ${shouldReconnect}`);
+  console.log("Conexão fechada:", {
+    sessionId,
+    statusCode,
+    errorMessage,
+    shouldReconnect
+  });
 }
     });
 
