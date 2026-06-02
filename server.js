@@ -56,13 +56,17 @@ app.post("/sessions", checkSecret, async (req, res) => {
   const sessionId = `store_${store_id}`;
 
   if (sessions.has(sessionId)) {
-    const existingSession = sessions.get(sessionId);
+  const existingSession = sessions.get(sessionId);
 
+  if (existingSession.status !== "desconectado" && existingSession.status !== "erro") {
     return res.json({
       session_id: sessionId,
       status: existingSession.status,
       qr_code: existingSession.qrCode || null
     });
+  }
+
+  sessions.delete(sessionId);
   }
 
   const sessionData = {
@@ -105,15 +109,14 @@ app.post("/sessions", checkSecret, async (req, res) => {
       }
 
       if (connection === "close") {
-        const shouldReconnect =
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+  const shouldReconnect =
+    lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
 
-        sessionData.status = "desconectado";
+  sessionData.status = shouldReconnect ? "desconectado" : "deslogado";
+  sessionData.qrCode = null;
 
-        if (shouldReconnect) {
-          sessions.delete(sessionId);
-        }
-      }
+  console.log(`Sessão ${sessionId} fechada. Reconectar: ${shouldReconnect}`);
+}
     });
 
     sock.ev.on("messages.upsert", async (messageUpdate) => {
