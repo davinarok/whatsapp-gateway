@@ -15,11 +15,14 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_SECRET = process.env.WHATSAPP_GATEWAY_SECRET;
 const AUTH_PATH = process.env.AUTH_PATH || "./auth";
+
+const SYSTEM_WEBHOOK_URL = process.env.SYSTEM_WEBHOOK_URL;
+const SYSTEM_WEBHOOK_SECRET = process.env.SYSTEM_WEBHOOK_SECRET;
 
 const sessions = new Map();
 const reconnectTimers = new Map();
@@ -46,6 +49,53 @@ function normalizePhone(phone) {
   return phone.includes("@s.whatsapp.net")
     ? phone
     : `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+}
+
+function cleanPhoneFromJid(jid) {
+  return jid
+    .replace("@s.whatsapp.net", "")
+    .replace("@c.us", "")
+    .replace(/\D/g, "");
+}
+
+function extractMessageText(message) {
+  return (
+    message?.conversation ||
+    message?.extendedTextMessage?.text ||
+    message?.imageMessage?.caption ||
+    message?.videoMessage?.caption ||
+    message?.documentMessage?.caption ||
+    ""
+  );
+}
+
+function extractMessageType(message) {
+  if (message?.conversation) return "text";
+  if (message?.extendedTextMessage) return "text";
+  if (message?.imageMessage) return "image";
+  if (message?.videoMessage) return "video";
+  if (message?.audioMessage) return "audio";
+  if (message?.documentMessage) return "document";
+  if (message?.stickerMessage) return "sticker";
+  if (message?.locationMessage) return "location";
+  if (message?.contactMessage) return "contact";
+  return "unknown";
+}
+
+function getMessageTimestamp(messageTimestamp) {
+  try {
+    if (!messageTimestamp) return new Date().toISOString();
+
+    const timestampNumber = Number(messageTimestamp);
+
+    if (Number.isNaN(timestampNumber)) {
+      return new Date().toISOString();
+    }
+
+    return new Date(timestampNumber * 1000).toISOString();
+  } catch {
+    return new Date().toISOString();
+  }
 }
 
 function removeAuthFolder(sessionId) {
@@ -89,6 +139,122 @@ function clearReconnectTimer(sessionId) {
   if (reconnectTimers.has(sessionId)) {
     clearTimeout(reconnectTimers.get(sessionId));
     reconnectTimers.delete(sessionId);
+  }
+}
+
+async function sendMessageToSystemWebhook(payload) {
+  if (!SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) {
+    console.log("Webhook do sistema não configurado. Mensagem não enviada ao Supabase.", {
+      hasWebhookUrl: Boolean(SYSTEM_WEBHOOK_URL),
+      hasWebhookSecret: Boolean(SYSTEM_WEBHOOK_SECRET)
+    });
+
+    return {
+      success: false,
+      skipped: true,
+      reason: "webhook_not_configured"
+    };
+  }
+
+  try {
+    const response = await fetch(SYSTEM_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": SYSTEM_WEBHOOK_SECRET
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const responseText = await response.text();
+
+    console.log("Resposta do webhook:", {
+      status: response.status,
+      ok: response.ok,
+      body: responseText
+    });
+
+    return {
+      success: response.ok,
+      status: response.status,
+      body: responseText
+    };
+  } catch (error) {
+    console.log("Erro ao enviar mensagem para webhook:", error.message);
+
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId }) {
+  const messages = messageUpdate.messages || [];
+
+  for (const msg of messages) {
+    try {
+      if (!msg?.message) continue;
+
+      const remoteJid = msg.key?.remoteJid || "";
+      const fromMe = Boolean(msg.key?.fromMe);
+      const messageId = msg.key?.id || null;
+
+      if (!remoteJid) continue;
+
+      // Ignora grupos neste MVP
+      if (remoteJid.includes("@g.us")) {
+        console.log("Mensagem de grupo ignorada:", remoteJid);
+        continue;
+      }
+
+      // Ignora status/broadcast
+      if (remoteJid === "status@broadcast") {
+        continue;
+      }
+
+      const contactPhone = cleanPhoneFromJid(remoteJid);
+      const messageText = extractMessageText(msg.message);
+      const messageType = extractMessageType(msg.message);
+
+      // Para o MVP, ignora eventos sem texto/mídia relevante
+      if (!messageText && messageType === "unknown") {
+        console.log("Mensagem ignorada sem conteúdo útil:", {
+          sessionId,
+          remoteJid,
+          messageId,
+          messageType
+        });
+        continue;
+      }
+
+      const payload = {
+        store_id: storeId,
+        session_id: sessionId,
+        contact_phone: contactPhone,
+        contact_name: msg.pushName || null,
+        message_id: messageId,
+        from_me: fromMe,
+        message_text: messageText,
+        message_type: messageType,
+        timestamp: getMessageTimestamp(msg.messageTimestamp),
+        raw_payload: msg
+      };
+
+      console.log("Mensagem processada:", {
+        sessionId,
+        storeId,
+        contactPhone,
+        fromMe,
+        messageText,
+        messageType,
+        messageId
+      });
+
+      await sendMessageToSystemWebhook(payload);
+    } catch (error) {
+      console.log("Erro ao processar uma mensagem:", error.message);
+    }
   }
 }
 
@@ -219,7 +385,11 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   });
 
   sock.ev.on("messages.upsert", async (messageUpdate) => {
-    console.log("Mensagem recebida:", JSON.stringify(messageUpdate, null, 2));
+    await processIncomingOrOutgoingMessages({
+      messageUpdate,
+      sessionId,
+      storeId
+    });
   });
 
   return sessionData;
@@ -228,7 +398,8 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
 app.get("/", (req, res) => {
   res.json({
     status: "online",
-    service: "whatsapp-gateway"
+    service: "whatsapp-gateway",
+    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET)
   });
 });
 
@@ -312,7 +483,8 @@ app.get("/sessions/:sessionId/status", checkSecret, (req, res) => {
     status: sessionData.status,
     qr_code: sessionData.qrCode || null,
     last_error: sessionData.lastError || null,
-    reconnect_attempts: sessionData.reconnectAttempts || 0
+    reconnect_attempts: sessionData.reconnectAttempts || 0,
+    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET)
   });
 });
 
@@ -356,25 +528,25 @@ app.post("/messages/send", checkSecret, async (req, res) => {
     const jid = normalizePhone(phone);
 
     const result = await sessionData.sock.sendMessage(jid, {
-  text: message
-});
+      text: message
+    });
 
-console.log("Mensagem enviada pelo endpoint:", {
-  session_id,
-  phone,
-  jid,
-  message,
-  result
-});
+    console.log("Mensagem enviada pelo endpoint:", {
+      session_id,
+      phone,
+      jid,
+      message,
+      result
+    });
 
-return res.json({
-  success: true,
-  jid,
-  message_id: result?.key?.id || null,
-  from_me: result?.key?.fromMe || null,
-  status: result?.status || null,
-  raw_result: result
-});
+    return res.json({
+      success: true,
+      jid,
+      message_id: result?.key?.id || null,
+      from_me: result?.key?.fromMe || null,
+      status: result?.status || null,
+      raw_result: result
+    });
   } catch (error) {
     return res.status(500).json({
       error: "Erro ao enviar mensagem",
