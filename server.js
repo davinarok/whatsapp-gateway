@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import QRCode from "qrcode";
 import pino from "pino";
+import fs from "fs";
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -18,6 +19,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_SECRET = process.env.WHATSAPP_GATEWAY_SECRET;
+const AUTH_PATH = process.env.AUTH_PATH || "./auth";
 
 const sessions = new Map();
 
@@ -39,6 +41,45 @@ function checkSecret(req, res, next) {
   next();
 }
 
+function normalizePhone(phone) {
+  return phone.includes("@s.whatsapp.net")
+    ? phone
+    : `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+}
+
+async function closeSocketSafely(sessionData) {
+  if (!sessionData?.sock) return;
+
+  try {
+    await sessionData.sock.logout();
+  } catch (error) {
+    console.log("Erro ao fazer logout da sessão:", error.message);
+  }
+
+  try {
+    sessionData.sock.end?.();
+  } catch (error) {
+    console.log("Erro ao encerrar socket:", error.message);
+  }
+}
+
+function removeAuthFolder(sessionId) {
+  const sessionAuthPath = `${AUTH_PATH}/${sessionId}`;
+
+  try {
+    if (fs.existsSync(sessionAuthPath)) {
+      fs.rmSync(sessionAuthPath, {
+        recursive: true,
+        force: true
+      });
+    }
+
+    console.log(`Pasta de autenticação removida: ${sessionAuthPath}`);
+  } catch (error) {
+    console.log("Erro ao remover pasta de autenticação:", error.message);
+  }
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "online",
@@ -58,17 +99,21 @@ app.post("/sessions", checkSecret, async (req, res) => {
   const sessionId = `store_${store_id}`;
 
   if (sessions.has(sessionId)) {
-  const existingSession = sessions.get(sessionId);
+    const existingSession = sessions.get(sessionId);
 
-  if (existingSession.status !== "desconectado" && existingSession.status !== "erro") {
-    return res.json({
-      session_id: sessionId,
-      status: existingSession.status,
-      qr_code: existingSession.qrCode || null
-    });
-  }
+    if (
+      existingSession.status !== "desconectado" &&
+      existingSession.status !== "erro" &&
+      existingSession.status !== "deslogado"
+    ) {
+      return res.json({
+        session_id: sessionId,
+        status: existingSession.status,
+        qr_code: existingSession.qrCode || null
+      });
+    }
 
-  sessions.delete(sessionId);
+    sessions.delete(sessionId);
   }
 
   const sessionData = {
@@ -77,32 +122,32 @@ app.post("/sessions", checkSecret, async (req, res) => {
     userId: user_id || null,
     status: "starting",
     qrCode: null,
-    sock: null
+    sock: null,
+    lastError: null
   };
 
   sessions.set(sessionId, sessionData);
 
   try {
-    const authPath = process.env.AUTH_PATH || "./auth";
-    const { state, saveCreds } = await useMultiFileAuthState(`${authPath}/${sessionId}`);
+    const { state, saveCreds } = await useMultiFileAuthState(`${AUTH_PATH}/${sessionId}`);
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
 
-console.log("Baileys version:", {
-  version,
-  isLatest
-});
+    console.log("Baileys version:", {
+      version,
+      isLatest
+    });
 
-const sock = makeWASocket({
-  version,
-  auth: state,
-  logger: pino({ level: "info" }),
-  printQRInTerminal: false,
-  browser: Browsers.macOS("Desktop"),
-  syncFullHistory: false,
-  connectTimeoutMs: 60000,
-  defaultQueryTimeoutMs: 60000
-});
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: "info" }),
+      printQRInTerminal: false,
+      browser: Browsers.macOS("Desktop"),
+      syncFullHistory: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000
+    });
 
     sessionData.sock = sock;
     sessionData.status = "aguardando_qr";
@@ -115,28 +160,39 @@ const sock = makeWASocket({
       if (qr) {
         sessionData.status = "aguardando_qr";
         sessionData.qrCode = await QRCode.toDataURL(qr);
+        sessionData.lastError = null;
+
+        console.log(`QR Code gerado para sessão ${sessionId}`);
       }
 
       if (connection === "open") {
         sessionData.status = "conectado";
         sessionData.qrCode = null;
+        sessionData.lastError = null;
+
+        console.log(`Sessão ${sessionId} conectada`);
       }
 
       if (connection === "close") {
-  const statusCode = lastDisconnect?.error?.output?.statusCode;
-  const errorMessage = lastDisconnect?.error?.message;
-  const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-  sessionData.status = shouldReconnect ? "desconectado" : "deslogado";
-  sessionData.qrCode = null;
+        sessionData.status = shouldReconnect ? "desconectado" : "deslogado";
+        sessionData.qrCode = null;
+        sessionData.lastError = {
+          statusCode,
+          errorMessage,
+          shouldReconnect
+        };
 
-  console.log("Conexão fechada:", {
-    sessionId,
-    statusCode,
-    errorMessage,
-    shouldReconnect
-  });
-}
+        console.log("Conexão fechada:", {
+          sessionId,
+          statusCode,
+          errorMessage,
+          shouldReconnect
+        });
+      }
     });
 
     sock.ev.on("messages.upsert", async (messageUpdate) => {
@@ -152,6 +208,9 @@ const sock = makeWASocket({
     console.error(error);
 
     sessionData.status = "erro";
+    sessionData.lastError = {
+      errorMessage: error.message
+    };
 
     return res.status(500).json({
       error: "Erro ao criar sessão WhatsApp",
@@ -174,7 +233,25 @@ app.get("/sessions/:sessionId/status", checkSecret, (req, res) => {
   return res.json({
     session_id: sessionId,
     status: sessionData.status,
-    qr_code: sessionData.qrCode || null
+    qr_code: sessionData.qrCode || null,
+    last_error: sessionData.lastError || null
+  });
+});
+
+app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
+  const { sessionId } = req.params;
+
+  const sessionData = sessions.get(sessionId);
+
+  await closeSocketSafely(sessionData);
+
+  sessions.delete(sessionId);
+  removeAuthFolder(sessionId);
+
+  return res.json({
+    success: true,
+    session_id: sessionId,
+    message: "Sessão removida. Gere um novo QR Code."
   });
 });
 
@@ -195,17 +272,22 @@ app.post("/messages/send", checkSecret, async (req, res) => {
     });
   }
 
-  const jid = phone.includes("@s.whatsapp.net")
-    ? phone
-    : `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+  try {
+    const jid = normalizePhone(phone);
 
-  await sessionData.sock.sendMessage(jid, {
-    text: message
-  });
+    await sessionData.sock.sendMessage(jid, {
+      text: message
+    });
 
-  return res.json({
-    success: true
-  });
+    return res.json({
+      success: true
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Erro ao enviar mensagem",
+      details: error.message
+    });
+  }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
