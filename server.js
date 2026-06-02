@@ -355,13 +355,26 @@ app.post("/messages/send", checkSecret, async (req, res) => {
   try {
     const jid = normalizePhone(phone);
 
-    await sessionData.sock.sendMessage(jid, {
-      text: message
-    });
+    const result = await sessionData.sock.sendMessage(jid, {
+  text: message
+});
 
-    return res.json({
-      success: true
-    });
+console.log("Mensagem enviada pelo endpoint:", {
+  session_id,
+  phone,
+  jid,
+  message,
+  result
+});
+
+return res.json({
+  success: true,
+  jid,
+  message_id: result?.key?.id || null,
+  from_me: result?.key?.fromMe || null,
+  status: result?.status || null,
+  raw_result: result
+});
   } catch (error) {
     return res.status(500).json({
       error: "Erro ao enviar mensagem",
