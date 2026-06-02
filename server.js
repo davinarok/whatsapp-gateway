@@ -1,4 +1,3 @@
-cat > server.js <<'EOF'
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -78,7 +77,8 @@ app.post("/sessions", checkSecret, async (req, res) => {
   sessions.set(sessionId, sessionData);
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(`./auth/${sessionId}`);
+    const authPath = process.env.AUTH_PATH || "./auth";
+    const { state, saveCreds } = await useMultiFileAuthState(`${authPath}/${sessionId}`);
 
     const sock = makeWASocket({
       auth: state,
@@ -185,7 +185,6 @@ app.post("/messages/send", checkSecret, async (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`WhatsApp Gateway rodando na porta ${PORT}`);
 });
-EOF
