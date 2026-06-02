@@ -5,7 +5,9 @@ import QRCode from "qrcode";
 import pino from "pino";
 import makeWASocket, {
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  Browsers
 } from "@whiskeysockets/baileys";
 
 dotenv.config();
@@ -84,11 +86,19 @@ app.post("/sessions", checkSecret, async (req, res) => {
     const authPath = process.env.AUTH_PATH || "./auth";
     const { state, saveCreds } = await useMultiFileAuthState(`${authPath}/${sessionId}`);
 
-    const sock = makeWASocket({
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+
+console.log("Baileys version:", {
+  version,
+  isLatest
+});
+
+const sock = makeWASocket({
+  version,
   auth: state,
   logger: pino({ level: "info" }),
   printQRInTerminal: false,
-  browser: ["Alavanch Gateway", "Chrome", "1.0.0"],
+  browser: Browsers.macOS("Desktop"),
   syncFullHistory: false,
   connectTimeoutMs: 60000,
   defaultQueryTimeoutMs: 60000
