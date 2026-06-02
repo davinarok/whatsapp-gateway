@@ -85,10 +85,14 @@ app.post("/sessions", checkSecret, async (req, res) => {
     const { state, saveCreds } = await useMultiFileAuthState(`${authPath}/${sessionId}`);
 
     const sock = makeWASocket({
-      auth: state,
-      logger: pino({ level: "silent" }),
-      printQRInTerminal: false
-    });
+  auth: state,
+  logger: pino({ level: "info" }),
+  printQRInTerminal: false,
+  browser: ["Alavanch Gateway", "Chrome", "1.0.0"],
+  syncFullHistory: false,
+  connectTimeoutMs: 60000,
+  defaultQueryTimeoutMs: 60000
+});
 
     sessionData.sock = sock;
     sessionData.status = "aguardando_qr";
