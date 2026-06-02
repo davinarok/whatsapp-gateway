@@ -352,16 +352,24 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       }
 
       const payload = {
+        tipo: "whatsapp_message",
+        conta_id: storeId,
+
         store_id: storeId,
         session_id: sessionId,
+
         contact_phone: contactIdentity.contact_phone,
         contact_jid: contactIdentity.contact_jid,
         contact_lid: contactIdentity.contact_lid,
         contact_name: msg.pushName || null,
+
         message_id: messageId,
         from_me: fromMe,
+        direction: fromMe ? "outbound" : "inbound",
+
         message_text: messageText,
         message_type: messageType,
+
         timestamp: getMessageTimestamp(msg.messageTimestamp),
         raw_payload: msg
       };
@@ -369,10 +377,13 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       console.log("Mensagem processada:", {
         sessionId,
         storeId,
+        contaId: storeId,
+        tipo: "whatsapp_message",
         contactPhone: contactIdentity.contact_phone,
         contactJid: contactIdentity.contact_jid,
         contactLid: contactIdentity.contact_lid,
         fromMe,
+        direction: fromMe ? "outbound" : "inbound",
         messageText,
         messageType,
         messageId
