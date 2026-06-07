@@ -8,14 +8,16 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  Browsers
+  Browsers,
+  downloadMediaMessage
 } from "@whiskeysockets/baileys";
 
 dotenv.config();
 
 const app = express();
+
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "90mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_SECRET = process.env.WHATSAPP_GATEWAY_SECRET;
@@ -23,6 +25,9 @@ const AUTH_PATH = process.env.AUTH_PATH || "./auth";
 
 const SYSTEM_WEBHOOK_URL = process.env.SYSTEM_WEBHOOK_URL;
 const SYSTEM_WEBHOOK_SECRET = process.env.SYSTEM_WEBHOOK_SECRET;
+
+const MAX_MEDIA_SIZE_MB = Number(process.env.MAX_MEDIA_SIZE_MB || 60);
+const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 
 const sessions = new Map();
 const reconnectTimers = new Map();
@@ -204,6 +209,52 @@ function extractMessageType(message) {
   return "unknown";
 }
 
+function getMediaInfo(message) {
+  const cleanMessage = unwrapMessage(message);
+
+  if (cleanMessage?.imageMessage) {
+    return {
+      media_type: "image",
+      media_message: cleanMessage.imageMessage,
+      baileys_type: "imageMessage"
+    };
+  }
+
+  if (cleanMessage?.videoMessage) {
+    return {
+      media_type: "video",
+      media_message: cleanMessage.videoMessage,
+      baileys_type: "videoMessage"
+    };
+  }
+
+  if (cleanMessage?.audioMessage) {
+    return {
+      media_type: "audio",
+      media_message: cleanMessage.audioMessage,
+      baileys_type: "audioMessage"
+    };
+  }
+
+  if (cleanMessage?.documentMessage) {
+    return {
+      media_type: "document",
+      media_message: cleanMessage.documentMessage,
+      baileys_type: "documentMessage"
+    };
+  }
+
+  if (cleanMessage?.stickerMessage) {
+    return {
+      media_type: "sticker",
+      media_message: cleanMessage.stickerMessage,
+      baileys_type: "stickerMessage"
+    };
+  }
+
+  return null;
+}
+
 function getMessageTimestamp(messageTimestamp) {
   try {
     if (!messageTimestamp) return new Date().toISOString();
@@ -293,7 +344,7 @@ async function sendMessageToSystemWebhook(payload) {
     console.log("Resposta do webhook:", {
       status: response.status,
       ok: response.ok,
-      body: responseText
+      body: responseText?.slice?.(0, 1000) || responseText
     });
 
     return {
@@ -311,8 +362,126 @@ async function sendMessageToSystemWebhook(payload) {
   }
 }
 
+async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
+  const logger = pino({ level: "info" });
+
+  const buffer = await downloadMediaMessage(
+    msg,
+    "buffer",
+    {},
+    {
+      logger,
+      reuploadRequest: sock.updateMediaMessage
+    }
+  );
+
+  if (!buffer || !Buffer.isBuffer(buffer)) {
+    throw new Error("Falha ao baixar mídia do WhatsApp");
+  }
+
+  if (buffer.length > MAX_MEDIA_SIZE_BYTES) {
+    throw new Error(`Mídia excede o limite de ${MAX_MEDIA_SIZE_MB}MB`);
+  }
+
+  const mediaMessage = mediaInfo.media_message || {};
+
+  return {
+    media_base64: buffer.toString("base64"),
+    media_size_bytes: buffer.length,
+    media_type: mediaInfo.media_type,
+    media_mime_type: mediaMessage.mimetype || null,
+    media_file_name:
+      mediaMessage.fileName ||
+      mediaMessage.title ||
+      `${mediaInfo.media_type}-${Date.now()}`,
+    media_caption: mediaMessage.caption || null,
+    media_seconds: mediaMessage.seconds || null,
+    media_file_length: mediaMessage.fileLength?.toString?.() || null,
+    media_baileys_type: mediaInfo.baileys_type
+  };
+}
+
+async function getBufferFromMediaRequest(body) {
+  if (body.media_base64) {
+    const base64 = String(body.media_base64).includes(",")
+      ? String(body.media_base64).split(",").pop()
+      : String(body.media_base64);
+
+    const buffer = Buffer.from(base64, "base64");
+
+    if (buffer.length > MAX_MEDIA_SIZE_BYTES) {
+      throw new Error(`Mídia excede o limite de ${MAX_MEDIA_SIZE_MB}MB`);
+    }
+
+    return buffer;
+  }
+
+  if (body.media_url) {
+    const response = await fetch(body.media_url);
+
+    if (!response.ok) {
+      throw new Error(`Erro ao baixar media_url: HTTP ${response.status}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (buffer.length > MAX_MEDIA_SIZE_BYTES) {
+      throw new Error(`Mídia excede o limite de ${MAX_MEDIA_SIZE_MB}MB`);
+    }
+
+    return buffer;
+  }
+
+  throw new Error("Informe media_base64 ou media_url");
+}
+
+function buildBaileysMediaMessage({ mediaType, buffer, mimetype, fileName, caption }) {
+  if (mediaType === "image") {
+    return {
+      image: buffer,
+      mimetype: mimetype || "image/jpeg",
+      caption: caption || undefined
+    };
+  }
+
+  if (mediaType === "video") {
+    return {
+      video: buffer,
+      mimetype: mimetype || "video/mp4",
+      caption: caption || undefined
+    };
+  }
+
+  if (mediaType === "audio") {
+    return {
+      audio: buffer,
+      mimetype: mimetype || "audio/mpeg",
+      ptt: false
+    };
+  }
+
+  if (mediaType === "document") {
+    return {
+      document: buffer,
+      mimetype: mimetype || "application/octet-stream",
+      fileName: fileName || `documento-${Date.now()}`
+    };
+  }
+
+  if (mediaType === "sticker") {
+    return {
+      sticker: buffer
+    };
+  }
+
+  throw new Error("media_type inválido. Use image, video, audio, document ou sticker.");
+}
+
 async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId }) {
   const messages = messageUpdate.messages || [];
+
+  const sessionData = sessions.get(sessionId);
 
   for (const msg of messages) {
     try {
@@ -337,8 +506,9 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       const cleanMessage = unwrapMessage(msg.message);
       const messageText = extractMessageText(cleanMessage);
       const messageType = extractMessageType(cleanMessage);
+      const mediaInfo = getMediaInfo(cleanMessage);
 
-      if (!messageText && ["unknown", "protocol", "reaction", "context"].includes(messageType)) {
+      if (!messageText && !mediaInfo && ["unknown", "protocol", "reaction", "context"].includes(messageType)) {
         console.log("Mensagem ignorada sem conteúdo útil:", {
           sessionId,
           remoteJid,
@@ -349,6 +519,48 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
           rawKeys: cleanMessage ? Object.keys(cleanMessage) : []
         });
         continue;
+      }
+
+      let mediaPayload = null;
+
+      if (mediaInfo) {
+        try {
+          console.log("Mídia recebida. Iniciando download:", {
+            sessionId,
+            storeId,
+            messageId,
+            mediaType: mediaInfo.media_type,
+            mimetype: mediaInfo.media_message?.mimetype || null,
+            fileName: mediaInfo.media_message?.fileName || null
+          });
+
+          mediaPayload = await downloadIncomingMedia({
+            sock: sessionData?.sock,
+            msg,
+            mediaInfo
+          });
+
+          console.log("Mídia baixada com sucesso:", {
+            messageId,
+            mediaType: mediaPayload.media_type,
+            sizeBytes: mediaPayload.media_size_bytes,
+            mimetype: mediaPayload.media_mime_type
+          });
+        } catch (mediaError) {
+          console.log("Erro ao baixar mídia recebida:", {
+            messageId,
+            error: mediaError.message
+          });
+
+          mediaPayload = {
+            media_download_error: mediaError.message,
+            media_type: mediaInfo.media_type,
+            media_mime_type: mediaInfo.media_message?.mimetype || null,
+            media_file_name: mediaInfo.media_message?.fileName || null,
+            media_caption: mediaInfo.media_message?.caption || null,
+            media_baileys_type: mediaInfo.baileys_type
+          };
+        }
       }
 
       const payload = {
@@ -367,11 +579,35 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         from_me: fromMe,
         direction: fromMe ? "outbound" : "inbound",
 
-        message_text: messageText,
-        message_type: messageType,
+        message_text: messageText || mediaPayload?.media_caption || "",
+        message_type: mediaPayload ? "media" : messageType,
+
+        media_type: mediaPayload?.media_type || null,
+        media_mime_type: mediaPayload?.media_mime_type || null,
+        media_file_name: mediaPayload?.media_file_name || null,
+        media_caption: mediaPayload?.media_caption || null,
+        media_size_bytes: mediaPayload?.media_size_bytes || null,
+        media_base64: mediaPayload?.media_base64 || null,
+        media_download_error: mediaPayload?.media_download_error || null,
+        media_baileys_type: mediaPayload?.media_baileys_type || null,
 
         timestamp: getMessageTimestamp(msg.messageTimestamp),
-        raw_payload: msg
+
+        raw_payload: {
+          key: msg.key,
+          pushName: msg.pushName || null,
+          messageTimestamp: msg.messageTimestamp || null,
+          messageType,
+          mediaInfo: mediaInfo
+            ? {
+                media_type: mediaInfo.media_type,
+                baileys_type: mediaInfo.baileys_type,
+                mimetype: mediaInfo.media_message?.mimetype || null,
+                fileName: mediaInfo.media_message?.fileName || null,
+                caption: mediaInfo.media_message?.caption || null
+              }
+            : null
+        }
       };
 
       console.log("Mensagem processada:", {
@@ -384,8 +620,10 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         contactLid: contactIdentity.contact_lid,
         fromMe,
         direction: fromMe ? "outbound" : "inbound",
-        messageText,
-        messageType,
+        messageText: payload.message_text,
+        messageType: payload.message_type,
+        mediaType: payload.media_type,
+        hasMediaBase64: Boolean(payload.media_base64),
         messageId
       });
 
@@ -537,7 +775,26 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     service: "whatsapp-gateway",
-    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET)
+    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
+    media_enabled: true,
+    max_media_size_mb: MAX_MEDIA_SIZE_MB,
+    routes: [
+      "POST /sessions",
+      "GET /sessions/:sessionId/status",
+      "DELETE /sessions/:sessionId",
+      "POST /messages/send",
+      "POST /messages/send-media"
+    ]
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "online",
+    service: "whatsapp-gateway",
+    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
+    media_enabled: true,
+    max_media_size_mb: MAX_MEDIA_SIZE_MB
   });
 });
 
@@ -622,7 +879,8 @@ app.get("/sessions/:sessionId/status", checkSecret, (req, res) => {
     qr_code: sessionData.qrCode || null,
     last_error: sessionData.lastError || null,
     reconnect_attempts: sessionData.reconnectAttempts || 0,
-    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET)
+    webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
+    media_enabled: true
   });
 });
 
@@ -705,6 +963,112 @@ app.post("/messages/send", checkSecret, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       error: "Erro ao enviar mensagem",
+      details: error.message
+    });
+  }
+});
+
+app.post("/messages/send-media", checkSecret, async (req, res) => {
+  const {
+    session_id,
+    phone,
+    contact_jid,
+    media_type,
+    media_url,
+    media_base64,
+    media_mime_type,
+    media_file_name,
+    caption
+  } = req.body;
+
+  if (!session_id || (!phone && !contact_jid)) {
+    return res.status(400).json({
+      error: "session_id e phone ou contact_jid são obrigatórios"
+    });
+  }
+
+  if (!media_type) {
+    return res.status(400).json({
+      error: "media_type é obrigatório. Use image, video, audio, document ou sticker."
+    });
+  }
+
+  if (!media_url && !media_base64) {
+    return res.status(400).json({
+      error: "media_url ou media_base64 é obrigatório"
+    });
+  }
+
+  const sessionData = sessions.get(session_id);
+
+  if (!sessionData || sessionData.status !== "conectado") {
+    return res.status(400).json({
+      error: "Sessão não conectada"
+    });
+  }
+
+  try {
+    const preferredDestination = phone || contact_jid;
+
+    if (String(preferredDestination).endsWith("@lid")) {
+      return res.status(400).json({
+        error: "Não é possível enviar mídia para @lid. Use o telefone real do contato.",
+        code: "cannot_send_to_lid"
+      });
+    }
+
+    const jid = normalizePhoneToJid(preferredDestination);
+
+    if (!jid) {
+      return res.status(400).json({
+        error: "Destino inválido. Informe um telefone real ou um JID @s.whatsapp.net.",
+        code: "invalid_destination"
+      });
+    }
+
+    const buffer = await getBufferFromMediaRequest({
+      media_url,
+      media_base64
+    });
+
+    const baileysMessage = buildBaileysMediaMessage({
+      mediaType: media_type,
+      buffer,
+      mimetype: media_mime_type,
+      fileName: media_file_name,
+      caption
+    });
+
+    const result = await sessionData.sock.sendMessage(jid, baileysMessage);
+
+    console.log("Mídia enviada pelo endpoint:", {
+      session_id,
+      phone,
+      contact_jid,
+      jid,
+      media_type,
+      media_mime_type,
+      media_file_name,
+      sizeBytes: buffer.length,
+      messageId: result?.key?.id || null
+    });
+
+    return res.json({
+      success: true,
+      jid,
+      message_id: result?.key?.id || null,
+      from_me: result?.key?.fromMe || null,
+      status: result?.status || null,
+      media_type,
+      media_mime_type: media_mime_type || null,
+      media_file_name: media_file_name || null,
+      raw_result: result
+    });
+  } catch (error) {
+    console.log("Erro ao enviar mídia:", error.message);
+
+    return res.status(500).json({
+      error: "Erro ao enviar mídia",
       details: error.message
     });
   }
