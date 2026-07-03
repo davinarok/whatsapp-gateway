@@ -32,6 +32,10 @@ const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 const sessions = new Map();
 const reconnectTimers = new Map();
 
+// Mapa temporário em memória: contact_lid -> contact_phone
+// Importante: some em redeploy/restart. O Lovable/Supabase também precisa persistir esse vínculo.
+const lidToPhoneMap = new Map();
+
 function checkSecret(req, res, next) {
   const secret = req.headers["x-gateway-secret"];
 
@@ -53,23 +57,15 @@ function checkSecret(req, res, next) {
 function normalizePhoneToJid(phone) {
   const value = String(phone || "").trim();
 
-  if (!value) {
-    return null;
-  }
+  if (!value) return null;
 
-  if (value.endsWith("@lid")) {
-    return null;
-  }
+  if (value.endsWith("@lid")) return null;
 
-  if (value.endsWith("@s.whatsapp.net")) {
-    return value;
-  }
+  if (value.endsWith("@s.whatsapp.net")) return value;
 
   const digits = value.replace(/\D/g, "");
 
-  if (!digits) {
-    return null;
-  }
+  if (!digits) return null;
 
   return `${digits}@s.whatsapp.net`;
 }
@@ -81,47 +77,185 @@ function cleanPhoneFromJid(jid) {
     .replace(/\D/g, "");
 }
 
-function getContactIdentity(remoteJid, msg = {}) {
-  const cleanJid = String(remoteJid || "").trim();
+function cleanLidFromJid(jid) {
+  return String(jid || "")
+    .replace("@lid", "")
+    .replace(/\D/g, "");
+}
 
-  const possibleJids = [
-    cleanJid,
+function isPhoneJid(value) {
+  return String(value || "").endsWith("@s.whatsapp.net");
+}
+
+function isLidJid(value) {
+  return String(value || "").endsWith("@lid");
+}
+
+function rememberLidPhoneMapping({ lid, phone, source = "unknown" }) {
+  const cleanLid = cleanLidFromJid(lid);
+  const cleanPhone = cleanPhoneFromJid(phone);
+
+  if (!cleanLid || !cleanPhone) return;
+
+  lidToPhoneMap.set(cleanLid, cleanPhone);
+
+  console.log("Mapeamento LID -> telefone salvo em memória:", {
+    lid: cleanLid,
+    phone: cleanPhone,
+    source
+  });
+}
+
+function getDeepStringValues(obj, maxDepth = 6) {
+  const results = [];
+  const seen = new WeakSet();
+
+  function walk(value, depth) {
+    if (!value || depth > maxDepth) return;
+
+    if (typeof value === "string") {
+      results.push(value);
+      return;
+    }
+
+    if (typeof value !== "object") return;
+    if (Buffer.isBuffer(value)) return;
+
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        walk(item, depth + 1);
+      }
+      return;
+    }
+
+    for (const child of Object.values(value)) {
+      walk(child, depth + 1);
+    }
+  }
+
+  walk(obj, 0);
+  return results;
+}
+
+function getDeepValuesByKey(obj, wantedKeys = [], maxDepth = 7) {
+  const results = [];
+  const seen = new WeakSet();
+
+  function walk(value, depth) {
+    if (!value || typeof value !== "object" || depth > maxDepth) return;
+    if (Buffer.isBuffer(value)) return;
+
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    for (const [key, child] of Object.entries(value)) {
+      if (wantedKeys.includes(key) && typeof child === "string") {
+        results.push(child);
+      }
+
+      if (child && typeof child === "object") {
+        walk(child, depth + 1);
+      }
+    }
+  }
+
+  walk(obj, 0);
+  return results;
+}
+
+function extractPossibleJids(msg = {}, remoteJid = "") {
+  const directValues = [
+    remoteJid,
+    msg?.key?.remoteJid,
+    msg?.key?.remoteJidAlt,
     msg?.key?.participant,
+    msg?.key?.participantAlt,
     msg?.participant,
+    msg?.participantAlt,
+    msg?.sender,
+    msg?.recipient,
     msg?.message?.senderKeyDistributionMessage?.groupId
   ].filter(Boolean);
 
-  const phoneJid = possibleJids.find((jid) =>
-    String(jid).endsWith("@s.whatsapp.net")
-  );
+  const deepByKey = getDeepValuesByKey(msg, [
+    "remoteJid",
+    "remoteJidAlt",
+    "participant",
+    "participantAlt",
+    "sender",
+    "recipient",
+    "jid",
+    "id",
+    "user",
+    "lid",
+    "phone"
+  ]);
+
+  const deepStrings = getDeepStringValues(msg).filter((value) => {
+    return value.includes("@s.whatsapp.net") || value.includes("@lid");
+  });
+
+  return [...new Set([...directValues, ...deepByKey, ...deepStrings])];
+}
+
+function getContactIdentity(remoteJid, msg = {}) {
+  const cleanJid = String(remoteJid || "").trim();
+
+  const possibleJids = extractPossibleJids(msg, cleanJid);
+
+  const phoneJid = possibleJids.find((jid) => isPhoneJid(jid));
+  const lidJid = possibleJids.find((jid) => isLidJid(jid));
+
+  const phone = phoneJid ? cleanPhoneFromJid(phoneJid) : null;
+
+  const lid = lidJid
+    ? cleanLidFromJid(lidJid)
+    : isLidJid(cleanJid)
+      ? cleanLidFromJid(cleanJid)
+      : null;
+
+  if (lid && phone) {
+    rememberLidPhoneMapping({
+      lid,
+      phone,
+      source: "same_payload"
+    });
+  }
+
+  if (isLidJid(cleanJid)) {
+    const mappedPhone = lid ? lidToPhoneMap.get(lid) : null;
+
+    return {
+      contact_phone: mappedPhone || null,
+      contact_jid: mappedPhone ? `${mappedPhone}@s.whatsapp.net` : cleanJid,
+      contact_lid: lid || null,
+      identity_source: mappedPhone ? "memory_lid_map" : "lid_only",
+      possible_jids_found: possibleJids
+    };
+  }
 
   if (phoneJid) {
-    const phone = cleanPhoneFromJid(phoneJid);
-
     return {
       contact_phone: phone || null,
       contact_jid: phoneJid,
-      contact_lid: null
+      contact_lid: lid || null,
+      identity_source: lid ? "phone_jid_with_lid" : "phone_jid",
+      possible_jids_found: possibleJids
     };
   }
 
-  if (cleanJid.endsWith("@lid")) {
-    const lid = cleanJid.replace("@lid", "").replace(/\D/g, "");
+  if (isPhoneJid(cleanJid)) {
+    const directPhone = cleanPhoneFromJid(cleanJid);
 
     return {
-      contact_phone: null,
+      contact_phone: directPhone || null,
       contact_jid: cleanJid,
-      contact_lid: lid || null
-    };
-  }
-
-  if (cleanJid.endsWith("@s.whatsapp.net")) {
-    const phone = cleanPhoneFromJid(cleanJid);
-
-    return {
-      contact_phone: phone || null,
-      contact_jid: cleanJid,
-      contact_lid: null
+      contact_lid: lid || null,
+      identity_source: "direct_phone_jid",
+      possible_jids_found: possibleJids
     };
   }
 
@@ -130,7 +264,9 @@ function getContactIdentity(remoteJid, msg = {}) {
   return {
     contact_phone: fallbackDigits || null,
     contact_jid: cleanJid || null,
-    contact_lid: null
+    contact_lid: lid || null,
+    identity_source: "fallback",
+    possible_jids_found: possibleJids
   };
 }
 
@@ -480,7 +616,6 @@ function buildBaileysMediaMessage({ mediaType, buffer, mimetype, fileName, capti
 
 async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId }) {
   const messages = messageUpdate.messages || [];
-
   const sessionData = sessions.get(sessionId);
 
   for (const msg of messages) {
@@ -574,6 +709,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         contact_jid: contactIdentity.contact_jid,
         contact_lid: contactIdentity.contact_lid,
         contact_name: msg.pushName || null,
+        identity_source: contactIdentity.identity_source,
 
         message_id: messageId,
         from_me: fromMe,
@@ -606,7 +742,8 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
                 fileName: mediaInfo.media_message?.fileName || null,
                 caption: mediaInfo.media_message?.caption || null
               }
-            : null
+            : null,
+          possible_jids_found: contactIdentity.possible_jids_found || []
         }
       };
 
@@ -618,6 +755,8 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         contactPhone: contactIdentity.contact_phone,
         contactJid: contactIdentity.contact_jid,
         contactLid: contactIdentity.contact_lid,
+        identitySource: contactIdentity.identity_source,
+        possibleJidsFound: contactIdentity.possible_jids_found || [],
         fromMe,
         direction: fromMe ? "outbound" : "inbound",
         messageText: payload.message_text,
@@ -778,6 +917,7 @@ app.get("/", (req, res) => {
     webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
     media_enabled: true,
     max_media_size_mb: MAX_MEDIA_SIZE_MB,
+    lid_phone_mappings_count: lidToPhoneMap.size,
     routes: [
       "POST /sessions",
       "GET /sessions/:sessionId/status",
@@ -794,7 +934,8 @@ app.get("/health", (req, res) => {
     service: "whatsapp-gateway",
     webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
     media_enabled: true,
-    max_media_size_mb: MAX_MEDIA_SIZE_MB
+    max_media_size_mb: MAX_MEDIA_SIZE_MB,
+    lid_phone_mappings_count: lidToPhoneMap.size
   });
 });
 
@@ -880,7 +1021,8 @@ app.get("/sessions/:sessionId/status", checkSecret, (req, res) => {
     last_error: sessionData.lastError || null,
     reconnect_attempts: sessionData.reconnectAttempts || 0,
     webhook_configured: Boolean(SYSTEM_WEBHOOK_URL && SYSTEM_WEBHOOK_SECRET),
-    media_enabled: true
+    media_enabled: true,
+    lid_phone_mappings_count: lidToPhoneMap.size
   });
 });
 
