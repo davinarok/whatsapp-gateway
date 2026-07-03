@@ -12,6 +12,14 @@ import makeWASocket, {
   downloadMediaMessage
 } from "@whiskeysockets/baileys";
 
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import os from "os";
+import path from "path";
+import { randomUUID } from "crypto";
+
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+
 dotenv.config();
 
 const app = express();
@@ -571,8 +579,44 @@ async function getBufferFromMediaRequest(body) {
 
   throw new Error("Informe media_base64 ou media_url");
 }
+async function convertAudioToOggOpus(inputBuffer) {
+  const tempDir = os.tmpdir();
 
-function buildBaileysMediaMessage({ mediaType, buffer, mimetype, fileName, caption }) {
+  const inputPath = path.join(tempDir, `audio-input-${randomUUID()}.webm`);
+  const outputPath = path.join(tempDir, `audio-output-${randomUUID()}.ogg`);
+
+  fs.writeFileSync(inputPath, inputBuffer);
+
+  try {
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .audioCodec("libopus")
+        .audioBitrate("48k")
+        .audioChannels(1)
+        .format("ogg")
+        .outputOptions([
+          "-vn",
+          "-application", "voip"
+        ])
+        .save(outputPath)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+
+    const outputBuffer = fs.readFileSync(outputPath);
+
+    return outputBuffer;
+  } finally {
+    try {
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    } catch {}
+
+    try {
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    } catch {}
+  }
+}
+async function buildBaileysMediaMessage({ mediaType, buffer, mimetype, fileName, caption }) {
   if (mediaType === "image") {
     return {
       image: buffer,
@@ -590,10 +634,21 @@ function buildBaileysMediaMessage({ mediaType, buffer, mimetype, fileName, capti
   }
 
   if (mediaType === "audio") {
+    console.log("Preparando áudio para WhatsApp:", {
+      originalMimetype: mimetype,
+      originalSizeBytes: buffer.length
+    });
+
+    const convertedBuffer = await convertAudioToOggOpus(buffer);
+
+    console.log("Áudio convertido para OGG/Opus:", {
+      convertedSizeBytes: convertedBuffer.length
+    });
+
     return {
-      audio: buffer,
-      mimetype: mimetype || "audio/mpeg",
-      ptt: false
+      audio: convertedBuffer,
+      mimetype: "audio/ogg; codecs=opus",
+      ptt: true
     };
   }
 
@@ -1173,13 +1228,13 @@ app.post("/messages/send-media", checkSecret, async (req, res) => {
       media_base64
     });
 
-    const baileysMessage = buildBaileysMediaMessage({
-      mediaType: media_type,
-      buffer,
-      mimetype: media_mime_type,
-      fileName: media_file_name,
-      caption
-    });
+    const baileysMessage = await buildBaileysMediaMessage({
+  mediaType: media_type,
+  buffer,
+  mimetype: media_mime_type,
+  fileName: media_file_name,
+  caption
+});
 
     const result = await sessionData.sock.sendMessage(jid, baileysMessage);
 
