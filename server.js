@@ -1270,7 +1270,33 @@ app.post("/messages/send-media", checkSecret, async (req, res) => {
     });
   }
 });
+const META_WEBHOOK_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN;
 
+app.get("/official/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log("Verificação webhook Meta recebida:", {
+    mode,
+    tokenMatches: token === META_WEBHOOK_VERIFY_TOKEN,
+    hasChallenge: Boolean(challenge)
+  });
+
+  if (mode === "subscribe" && token === META_WEBHOOK_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+app.post("/official/webhook", async (req, res) => {
+  console.log("Webhook oficial Meta recebido:", JSON.stringify(req.body, null, 2));
+
+  // Por enquanto apenas confirma para a Meta.
+  // Depois vamos normalizar e enviar para o webhook interno do Lovable/Supabase.
+  return res.sendStatus(200);
+});
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`WhatsApp Gateway rodando na porta ${PORT}`);
 });
