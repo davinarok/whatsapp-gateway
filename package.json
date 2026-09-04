@@ -2,10 +2,10 @@
   "name": "whatsapp-gateway",
   "version": "1.0.0",
   "description": "Gateway WhatsApp Web para integração com sistema Lovable",
-  "main": "server.js",
+  "main": "gateway-entry.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node gateway-entry.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
@@ -16,6 +16,5 @@
     "pino": "^9.4.0",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "fluent-ffmpeg": "^2.1.3"
-
   }
 }
