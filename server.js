@@ -1109,58 +1109,235 @@ app.post("/official/messages/send", checkSecret, async (req, res) => {
     return res.status(500).json({ error: "Erro ao enviar mensagem oficial", details: error.message });
   }
 });
+async function uploadOfficialMediaBufferToMeta({
+  phoneNumberId,
+  accessToken,
+  buffer,
+  filename,
+  mimeType
+}) {
+  if (!phoneNumberId) throw new Error("phoneNumberId ausente no upload de mídia Meta");
+  if (!accessToken) throw new Error("accessToken ausente no upload de mídia Meta");
+  if (!buffer || !Buffer.isBuffer(buffer)) throw new Error("buffer inválido no upload de mídia Meta");
 
+  const formData = new FormData();
+
+  formData.append("messaging_product", "whatsapp");
+
+  const blob = new Blob([buffer], { type: mimeType || "application/octet-stream" });
+  formData.append("file", blob, filename || `media-${Date.now()}`);
+
+  const response = await fetch(
+    `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/media`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: formData
+    }
+  );
+
+  const body = await response.json().catch(async () => ({
+    raw: await response.text()
+  }));
+
+  console.log("Upload de mídia oficial Meta:", {
+    status: response.status,
+    ok: response.ok,
+    phoneNumberId,
+    filename,
+    mimeType,
+    sizeBytes: buffer.length,
+    body
+  });
+
+  if (!response.ok) {
+    throw new Error(`Falha no upload de mídia Meta: HTTP ${response.status} ${JSON.stringify(body)}`);
+  }
+
+  if (!body?.id) {
+    throw new Error(`Upload de mídia Meta não retornou id: ${JSON.stringify(body)}`);
+  }
+
+  return body;
+}
 app.post("/official/messages/send-media", checkSecret, async (req, res) => {
-  const { phone_number_id, access_token, to, phone, media_type, media_url, media_id, caption, media_file_name } = req.body;
+  const {
+    phone_number_id,
+    access_token,
+    to,
+    phone,
+
+    // aliases aceitos pelo Lovable/Supabase
+    media_type,
+    type,
+
+    media_url,
+    media_id,
+
+    caption,
+
+    media_file_name,
+    filename,
+
+    media_mime_type,
+    mime_type
+  } = req.body;
+
   const targetPhoneNumberId = phone_number_id || META_PHONE_NUMBER_ID;
   const targetAccessToken = access_token || META_ACCESS_TOKEN;
   const destination = normalizeBrazilPhone(to || phone);
 
-  if (!targetPhoneNumberId) return res.status(400).json({ error: "phone_number_id é obrigatório para envio pela API oficial" });
-  if (!targetAccessToken) return res.status(400).json({ error: "access_token é obrigatório para envio pela API oficial" });
-  if (!destination || !media_type || (!media_url && !media_id)) {
-    return res.status(400).json({ error: "to/phone, media_type e media_url ou media_id são obrigatórios" });
-  }
-  if (!["image", "video", "audio", "document"].includes(media_type)) {
-    return res.status(400).json({ error: "media_type inválido para API oficial. Use image, video, audio ou document." });
+  const finalMediaType = media_type || type;
+  const finalFileName =
+    media_file_name ||
+    filename ||
+    `${finalMediaType || "media"}-${Date.now()}`;
+
+  const originalMimeType = media_mime_type || mime_type || null;
+
+  if (!targetPhoneNumberId) {
+    return res.status(400).json({
+      success: false,
+      error: "phone_number_id é obrigatório para envio pela API oficial"
+    });
   }
 
-  const mediaPayload = media_id ? { id: media_id } : { link: media_url };
-  if (caption && ["image", "video", "document"].includes(media_type)) mediaPayload.caption = caption;
-  if (media_file_name && media_type === "document") mediaPayload.filename = media_file_name;
+  if (!targetAccessToken) {
+    return res.status(400).json({
+      success: false,
+      error: "access_token é obrigatório para envio pela API oficial"
+    });
+  }
+
+  if (!destination || !finalMediaType || (!media_url && !media_id)) {
+    return res.status(400).json({
+      success: false,
+      error: "to/phone, media_type/type e media_url ou media_id são obrigatórios"
+    });
+  }
+
+  if (!["image", "video", "audio", "document"].includes(finalMediaType)) {
+    return res.status(400).json({
+      success: false,
+      error: "media_type inválido para API oficial. Use image, video, audio ou document."
+    });
+  }
 
   try {
-    const response = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${targetPhoneNumberId}/messages`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${targetAccessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: destination,
-        type: media_type,
-        [media_type]: mediaPayload
-      })
-    });
+    let finalMediaPayload = null;
+    let uploadResult = null;
 
-    const body = await response.json().catch(async () => ({ raw: await response.text() }));
+    const isWebmAudio =
+      finalMediaType === "audio" &&
+      (
+        String(originalMimeType || "").toLowerCase().includes("webm") ||
+        String(finalFileName || "").toLowerCase().endsWith(".webm")
+      );
+
+    if (media_id) {
+      finalMediaPayload = { id: media_id };
+    } else if (isWebmAudio) {
+      console.log("Áudio webm detectado para API Oficial Meta. Iniciando conversão:", {
+        phoneNumberId: targetPhoneNumberId,
+        to: destination,
+        originalMimeType,
+        fileName: finalFileName
+      });
+
+      const originalBuffer = await getBufferFromMediaRequest({ media_url });
+
+      console.log("Áudio webm baixado:", {
+        originalSizeBytes: originalBuffer.length,
+        originalMimeType
+      });
+
+      const convertedBuffer = await convertAudioToOggOpus(originalBuffer);
+
+      console.log("Áudio convertido para ogg/opus:", {
+        convertedSizeBytes: convertedBuffer.length
+      });
+
+      uploadResult = await uploadOfficialMediaBufferToMeta({
+        phoneNumberId: targetPhoneNumberId,
+        accessToken: targetAccessToken,
+        buffer: convertedBuffer,
+        filename: finalFileName.replace(/\.webm$/i, ".ogg"),
+        mimeType: "audio/ogg"
+      });
+
+      finalMediaPayload = { id: uploadResult.id };
+    } else {
+      finalMediaPayload = { link: media_url };
+    }
+
+    if (caption && ["image", "video", "document"].includes(finalMediaType)) {
+      finalMediaPayload.caption = caption;
+    }
+
+    if (finalFileName && finalMediaType === "document") {
+      finalMediaPayload.filename = finalFileName;
+    }
+
+    const response = await fetch(
+      `https://graph.facebook.com/${META_GRAPH_VERSION}/${targetPhoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${targetAccessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          recipient_type: "individual",
+          to: destination,
+          type: finalMediaType,
+          [finalMediaType]: finalMediaPayload
+        })
+      }
+    );
+
+    const body = await response.json().catch(async () => ({
+      raw: await response.text()
+    }));
 
     console.log("Envio de mídia oficial Meta:", {
       status: response.status,
       ok: response.ok,
       phoneNumberId: targetPhoneNumberId,
       to: destination,
-      mediaType: media_type,
+      mediaType: finalMediaType,
+      originalMimeType,
+      fileName: finalFileName,
+      usedMetaUpload: Boolean(uploadResult?.id),
+      metaMediaId: uploadResult?.id || media_id || null,
       body
     });
 
     return res.status(response.ok ? 200 : response.status).json({
       success: response.ok,
       status: response.status,
-      result: body
+      result: body,
+      meta_media_id: uploadResult?.id || media_id || null,
+      converted_audio: Boolean(isWebmAudio)
     });
   } catch (error) {
-    console.log("Erro ao enviar mídia oficial:", error.message);
-    return res.status(500).json({ error: "Erro ao enviar mídia oficial", details: error.message });
+    console.log("Erro ao enviar mídia oficial:", {
+      message: error.message,
+      mediaType: finalMediaType,
+      originalMimeType,
+      fileName: finalFileName
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: "Erro ao enviar mídia oficial",
+      details: error.message,
+      media_type: finalMediaType,
+      media_mime_type: originalMimeType,
+      media_file_name: finalFileName
+    });
   }
 });
 
