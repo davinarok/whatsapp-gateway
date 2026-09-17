@@ -15,13 +15,17 @@ const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v20.0";
 
 // O servidor legado (server.js) ainda cria sessão como `store_${store_id}`.
 // O sistema novo usa session_id canônico = whatsapp_contas.id.
-// Este proxy faz a ponte sem precisar reescrever o server.js inteiro:
+// Este proxy faz a ponte sem reescrever o server.js inteiro:
 // - entrada externa: session_id UUID
 // - runtime interno Baileys: store_UUID
 // - webhook de volta ao sistema: session_id volta a ser UUID
 const ORIGINAL_SYSTEM_WEBHOOK_URL = process.env.SYSTEM_WEBHOOK_URL;
 const ORIGINAL_SYSTEM_WEBHOOK_SECRET = process.env.SYSTEM_WEBHOOK_SECRET;
 const INTERNAL_WEBHOOK_PATH = "/__internal/system-webhook";
+
+// Mapeia a sessão canônica para a loja real informada pelo sistema.
+// Isso evita que o webhook devolva store_id = connection_id.
+const canonicalSessionStoreMap = new Map();
 
 function cleanDigits(value) {
   return String(value || "").replace(/\D/g, "");
@@ -35,10 +39,7 @@ function normalizeBrazilPhone(phone) {
 function checkSecret(req, res, next) {
   const secret = req.headers["x-gateway-secret"];
   if (!GATEWAY_SECRET) {
-    return res.status(500).json({
-      success: false,
-      error: "WHATSAPP_GATEWAY_SECRET não configurado no servidor"
-    });
+    return res.status(500).json({ success: false, error: "WHATSAPP_GATEWAY_SECRET não configurado no servidor" });
   }
   if (secret !== GATEWAY_SECRET) {
     return res.status(401).json({ success: false, error: "Não autorizado" });
@@ -93,19 +94,32 @@ function rewriteSessionFieldsToExternal(value) {
   return copy;
 }
 
-async function proxyJsonRequest({ req, res, targetPath, body }) {
-  const response = await fetch(`${internalBaseUrl}${targetPath}`, {
-    method: req.method,
-    headers: {
-      ...req.headers,
-      host: `127.0.0.1:${internalPort}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
+function buildForwardHeaders(req, extra = {}) {
+  const headers = { ...req.headers, host: `127.0.0.1:${internalPort}`, ...extra };
+  delete headers["content-length"];
+  delete headers["content-encoding"];
+  delete headers["transfer-encoding"];
+  return headers;
+}
 
-  const data = await response.json().catch(async () => ({ raw: await response.text() }));
-  return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+async function proxyJsonRequest({ req, res, targetPath, body }) {
+  try {
+    const response = await fetch(`${internalBaseUrl}${targetPath}`, {
+      method: req.method,
+      headers: buildForwardHeaders(req, { "content-type": "application/json" }),
+      body: JSON.stringify(body)
+    });
+
+    const data = await response.json().catch(async () => ({ raw: await response.text() }));
+    return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+  } catch (error) {
+    console.log("Erro no proxy JSON para servidor interno:", {
+      method: req.method,
+      targetPath,
+      message: error.message
+    });
+    return res.status(502).json({ success: false, error: "Erro ao encaminhar requisição para servidor interno", details: error.message });
+  }
 }
 
 async function startInternalServer() {
@@ -134,10 +148,17 @@ app.post(INTERNAL_WEBHOOK_PATH, async (req, res) => {
   if (!body) return res.status(400).json({ success: false, error: "JSON inválido" });
 
   if (body.connection_type === "qr" || body.raw_payload?.provider === "baileys_qr") {
-    body.session_id = toExternalSessionId(body.session_id);
-    body.sessionId = toExternalSessionId(body.sessionId || body.session_id);
-    if (body.conta_id && String(body.conta_id).startsWith("store_")) body.conta_id = toExternalSessionId(body.conta_id);
-    if (body.store_id && String(body.store_id).startsWith("store_")) body.store_id = toExternalSessionId(body.store_id);
+    const externalSessionId = toExternalSessionId(body.session_id || body.sessionId);
+    body.session_id = externalSessionId;
+    body.sessionId = externalSessionId;
+    body.connection_id = body.connection_id || externalSessionId;
+    body.conta_id = body.conta_id && String(body.conta_id).startsWith("store_")
+      ? toExternalSessionId(body.conta_id)
+      : (body.conta_id || externalSessionId);
+
+    const mappedStoreId = canonicalSessionStoreMap.get(externalSessionId);
+    if (mappedStoreId) body.store_id = mappedStoreId;
+    else if (body.store_id && String(body.store_id).startsWith("store_")) body.store_id = toExternalSessionId(body.store_id);
   }
 
   try {
@@ -169,6 +190,8 @@ app.post("/sessions", checkSecret, async (req, res) => {
     });
   }
 
+  if (body.store_id) canonicalSessionStoreMap.set(canonicalSessionId, String(body.store_id));
+
   const internalBody = {
     ...body,
     // O server.js legado monta `store_${store_id}`. Portanto, para ele criar
@@ -181,23 +204,33 @@ app.post("/sessions", checkSecret, async (req, res) => {
 });
 
 app.get("/sessions/:sessionId/status", checkSecret, async (req, res) => {
-  const internalSessionId = toInternalSessionId(req.params.sessionId);
-  const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(internalSessionId)}/status`, {
-    method: "GET",
-    headers: { "x-gateway-secret": GATEWAY_SECRET }
-  });
-  const data = await response.json().catch(async () => ({ raw: await response.text() }));
-  return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+  try {
+    const internalSessionId = toInternalSessionId(req.params.sessionId);
+    const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(internalSessionId)}/status`, {
+      method: "GET",
+      headers: { "x-gateway-secret": GATEWAY_SECRET }
+    });
+    const data = await response.json().catch(async () => ({ raw: await response.text() }));
+    return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+  } catch (error) {
+    return res.status(502).json({ success: false, error: "Erro ao consultar status da sessão", details: error.message });
+  }
 });
 
 app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
-  const internalSessionId = toInternalSessionId(req.params.sessionId);
-  const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(internalSessionId)}`, {
-    method: "DELETE",
-    headers: { "x-gateway-secret": GATEWAY_SECRET }
-  });
-  const data = await response.json().catch(async () => ({ raw: await response.text() }));
-  return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+  try {
+    const externalSessionId = toExternalSessionId(req.params.sessionId);
+    const internalSessionId = toInternalSessionId(externalSessionId);
+    canonicalSessionStoreMap.delete(externalSessionId);
+    const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(internalSessionId)}`, {
+      method: "DELETE",
+      headers: { "x-gateway-secret": GATEWAY_SECRET }
+    });
+    const data = await response.json().catch(async () => ({ raw: await response.text() }));
+    return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
+  } catch (error) {
+    return res.status(502).json({ success: false, error: "Erro ao remover sessão", details: error.message });
+  }
 });
 
 app.post(["/messages/send", "/messages/send-media"], checkSecret, async (req, res) => {
@@ -212,20 +245,9 @@ app.post(["/messages/send", "/messages/send-media"], checkSecret, async (req, re
 
 app.post("/official/messages/send-template", checkSecret, async (req, res) => {
   const body = parseJsonBody(req);
-  if (!body) {
-    return res.status(400).json({ success: false, error: "JSON inválido" });
-  }
+  if (!body) return res.status(400).json({ success: false, error: "JSON inválido" });
 
-  const {
-    phone_number_id,
-    access_token,
-    to,
-    phone,
-    template_name,
-    template,
-    language,
-    components
-  } = body;
+  const { phone_number_id, access_token, to, phone, template_name, template, language, components } = body;
 
   const targetPhoneNumberId = phone_number_id || META_PHONE_NUMBER_ID;
   const targetAccessToken = access_token || META_ACCESS_TOKEN;
@@ -234,53 +256,32 @@ app.post("/official/messages/send-template", checkSecret, async (req, res) => {
   const templateLanguage = language || "pt_BR";
 
   if (!targetPhoneNumberId) {
-    return res.status(400).json({
-      success: false,
-      error: "phone_number_id é obrigatório para envio de template pela API oficial"
-    });
+    return res.status(400).json({ success: false, error: "phone_number_id é obrigatório para envio de template pela API oficial" });
   }
 
   if (!targetAccessToken) {
-    return res.status(400).json({
-      success: false,
-      error: "access_token é obrigatório para envio de template pela API oficial"
-    });
+    return res.status(400).json({ success: false, error: "access_token é obrigatório para envio de template pela API oficial" });
   }
 
   if (!destination || !templateName) {
-    return res.status(400).json({
-      success: false,
-      error: "to/phone e template_name são obrigatórios"
-    });
+    return res.status(400).json({ success: false, error: "to/phone e template_name são obrigatórios" });
   }
 
   try {
-    const templatePayload = {
-      name: templateName,
-      language: { code: templateLanguage }
-    };
+    const templatePayload = { name: templateName, language: { code: templateLanguage } };
+    if (Array.isArray(components) && components.length > 0) templatePayload.components = components;
 
-    if (Array.isArray(components) && components.length > 0) {
-      templatePayload.components = components;
-    }
-
-    const response = await fetch(
-      `https://graph.facebook.com/${META_GRAPH_VERSION}/${targetPhoneNumberId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${targetAccessToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          recipient_type: "individual",
-          to: destination,
-          type: "template",
-          template: templatePayload
-        })
-      }
-    );
+    const response = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${targetPhoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${targetAccessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: destination,
+        type: "template",
+        template: templatePayload
+      })
+    });
 
     const responseBody = await response.json().catch(async () => ({ raw: await response.text() }));
 
@@ -295,23 +296,10 @@ app.post("/official/messages/send-template", checkSecret, async (req, res) => {
       body: responseBody
     });
 
-    return res.status(response.ok ? 200 : response.status).json({
-      success: response.ok,
-      status: response.status,
-      result: responseBody
-    });
+    return res.status(response.ok ? 200 : response.status).json({ success: response.ok, status: response.status, result: responseBody });
   } catch (error) {
-    console.log("Erro ao enviar template oficial:", {
-      message: error.message,
-      templateName,
-      language: templateLanguage
-    });
-
-    return res.status(500).json({
-      success: false,
-      error: "Erro ao enviar template oficial",
-      details: error.message
-    });
+    console.log("Erro ao enviar template oficial:", { message: error.message, templateName, language: templateLanguage });
+    return res.status(500).json({ success: false, error: "Erro ao enviar template oficial", details: error.message });
   }
 });
 
@@ -324,17 +312,26 @@ app.get("/", async (req, res) => {
       "POST /official/messages/send-template",
       "POST /sessions (proxy session_id canonico)",
       "GET /sessions/:sessionId/status (proxy session_id canonico)",
-      "DELETE /sessions/:sessionId (proxy session_id canonico)"
+      "DELETE /sessions/:sessionId (proxy session_id canonico)",
+      "POST /messages/send (proxy session_id canonico)",
+      "POST /messages/send-media (proxy session_id canonico)"
     ]) {
       if (!routes.includes(route)) routes.push(route);
     }
-    return res.status(response.status).json({ ...data, routes, canonical_qr_session_proxy: true });
+    return res.status(response.status).json({
+      ...data,
+      routes,
+      canonical_qr_session_proxy: true,
+      canonical_qr_session_proxy_version: 2,
+      mapped_qr_sessions_count: canonicalSessionStoreMap.size
+    });
   } catch (error) {
     return res.status(200).json({
       status: "online",
       service: "whatsapp-gateway",
       proxy_enabled: true,
       canonical_qr_session_proxy: true,
+      canonical_qr_session_proxy_version: 2,
       internal_server_error: error.message,
       routes: ["POST /official/messages/send-template"]
     });
@@ -344,8 +341,7 @@ app.get("/", async (req, res) => {
 app.use(async (req, res) => {
   try {
     const targetUrl = `${internalBaseUrl}${req.originalUrl}`;
-    const headers = { ...req.headers, host: `127.0.0.1:${internalPort}` };
-    delete headers["content-length"];
+    const headers = buildForwardHeaders(req);
 
     const response = await fetch(targetUrl, {
       method: req.method,
@@ -362,17 +358,8 @@ app.use(async (req, res) => {
 
     return res.status(response.status).send(responseBuffer);
   } catch (error) {
-    console.log("Erro ao encaminhar requisição para servidor interno:", {
-      method: req.method,
-      path: req.originalUrl,
-      message: error.message
-    });
-
-    return res.status(502).json({
-      success: false,
-      error: "Erro ao encaminhar requisição para servidor interno",
-      details: error.message
-    });
+    console.log("Erro ao encaminhar requisição para servidor interno:", { method: req.method, path: req.originalUrl, message: error.message });
+    return res.status(502).json({ success: false, error: "Erro ao encaminhar requisição para servidor interno", details: error.message });
   }
 });
 
