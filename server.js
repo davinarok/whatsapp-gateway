@@ -36,7 +36,7 @@ const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
 const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v20.0";
 const META_DEFAULT_STORE_ID = process.env.META_DEFAULT_STORE_ID || null;
 
-const MAX_MEDIA_SIZE_MB = Number(process.env.MAX_MEDIA_SIZE_MB || 60);
+const MAX_MEDIA_SIZE_MB = Number(process.env.MAX_MEDIA_SIZE_MB || 100);
 const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 
 const sessions = new Map();
@@ -336,7 +336,7 @@ async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
 
   const mediaMessage = mediaInfo.media_message || {};
   return {
-    media_base64: buffer.toString("base64"),
+    media_buffer: buffer,
     media_size_bytes: buffer.length,
     media_type: mediaInfo.media_type,
     media_mime_type: mediaMessage.mimetype || null,
@@ -347,6 +347,58 @@ async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
     media_baileys_type: mediaInfo.baileys_type
   };
 }
+
+async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromMe, contactIdentity, contactName, timestamp, mediaPayload }) {
+  if (!mediaPayload?.media_buffer || !SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return null;
+  const initPayload = {
+    tipo: "whatsapp_message",
+    conta_id: storeId,
+    store_id: storeId,
+    connection_type: "qr",
+    session_id: sessionId,
+    contact_phone: contactIdentity.contact_phone,
+    contact_jid: contactIdentity.contact_jid,
+    contact_lid: contactIdentity.contact_lid,
+    contact_name: contactName || null,
+    message_id: messageId,
+    from_me: fromMe,
+    direction: fromMe ? "outbound" : "inbound",
+    message_type: "media",
+    media_type: mediaPayload.media_type,
+    media_mime_type: mediaPayload.media_mime_type,
+    media_file_name: mediaPayload.media_file_name,
+    media_size_bytes: mediaPayload.media_size_bytes,
+    timestamp,
+    media_upload_init: true
+  };
+  const init = await sendMessageToSystemWebhook(initPayload);
+  if (!init?.success) throw new Error(`Falha ao inicializar upload direto: HTTP ${init?.status || "?"}`);
+  let parsed;
+  try { parsed = JSON.parse(init.body || "{}"); } catch { parsed = {}; }
+  const slot = parsed?.media_upload;
+  if (!slot?.signed_url || !slot?.storage_path) throw new Error("Webhook não retornou slot de upload");
+  const upload = await fetch(slot.signed_url, {
+    method: "PUT",
+    headers: {
+      "content-type": mediaPayload.media_mime_type || "application/octet-stream",
+      "cache-control": "max-age=3600",
+      "x-upsert": "false"
+    },
+    body: mediaPayload.media_buffer
+  });
+  if (!upload.ok) {
+    const detail = await upload.text().catch(() => "");
+    // Retry idempotente pode encontrar o objeto já criado.
+    if (upload.status !== 400 && upload.status !== 409) {
+      throw new Error(`Upload direto falhou HTTP ${upload.status}: ${detail.slice(0, 200)}`);
+    }
+    if (!/already exists|duplicate|KeyAlreadyExists/i.test(detail)) {
+      throw new Error(`Upload direto falhou HTTP ${upload.status}: ${detail.slice(0, 200)}`);
+    }
+  }
+  return slot.storage_path;
+}
+
 
 async function getBufferFromMediaRequest(body) {
   if (body.media_base64) {
@@ -635,9 +687,26 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
             fileName: mediaInfo.media_message?.fileName || null
           });
           mediaPayload = await downloadIncomingMedia({ sock: sessionData?.sock, msg, mediaInfo });
-          console.log("Mídia baixada com sucesso:", {
+          const msgTimestamp = getMessageTimestamp(msg.messageTimestamp);
+          try {
+            mediaPayload.media_storage_path = await persistIncomingMediaDirect({
+              sessionId, storeId, messageId, fromMe, contactIdentity,
+              contactName: msg.pushName || null, timestamp: msgTimestamp, mediaPayload
+            });
+          } catch (storageError) {
+            console.log("Falha no arquivamento direto da mídia:", { messageId, error: storageError.message });
+            // Compatibilidade temporária somente para arquivos pequenos; arquivos grandes não viram JSON Base64 gigante.
+            if (mediaPayload.media_size_bytes <= 25 * 1024 * 1024) {
+              mediaPayload.media_base64 = mediaPayload.media_buffer.toString("base64");
+            } else {
+              mediaPayload.media_download_error = `storage direto falhou: ${storageError.message}`;
+            }
+          }
+          delete mediaPayload.media_buffer;
+          console.log("Mídia baixada/processada:", {
             messageId, mediaType: mediaPayload.media_type,
             sizeBytes: mediaPayload.media_size_bytes,
+            persistedDirect: Boolean(mediaPayload.media_storage_path),
             mimetype: mediaPayload.media_mime_type
           });
         } catch (mediaError) {
@@ -679,6 +748,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         media_caption: mediaPayload?.media_caption || null,
         media_size_bytes: mediaPayload?.media_size_bytes || null,
         media_base64: mediaPayload?.media_base64 || null,
+        media_storage_path: mediaPayload?.media_storage_path || null,
         media_download_error: mediaPayload?.media_download_error || null,
         media_baileys_type: mediaPayload?.media_baileys_type || null,
 
