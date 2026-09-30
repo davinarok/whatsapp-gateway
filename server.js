@@ -843,6 +843,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
       sessionData.qrCode = await QRCode.toDataURL(qr);
       sessionData.lastError = null;
       console.log(`QR Code gerado para sessão ${sessionId}`);
+      await sendMessageToSystemWebhook({
+        tipo: "qr_atualizado",
+        conta_id: sessionId,
+        session_id: sessionId,
+        qr_code: sessionData.qrCode,
+        qr_atualizado_em: new Date().toISOString()
+      });
     }
 
     if (connection === "open") {
@@ -852,6 +859,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
       sessionData.reconnectAttempts = 0;
       clearReconnectTimer(sessionId);
       console.log(`Sessão ${sessionId} conectada`);
+      await sendMessageToSystemWebhook({
+        tipo: "conectado",
+        conta_id: sessionId,
+        session_id: sessionId,
+        numero: sock.user?.id?.split(":")?.[0] || null,
+        jid: sock.user?.id || null
+      });
     }
 
     if (connection === "close") {
@@ -863,6 +877,15 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
       sessionData.lastError = { statusCode, errorMessage, shouldReconnect };
 
       console.log("Conexão fechada:", { sessionId, statusCode, errorMessage, shouldReconnect });
+
+      if (!shouldReconnect) {
+        await sendMessageToSystemWebhook({
+          tipo: "desconectado",
+          conta_id: sessionId,
+          session_id: sessionId,
+          motivo: errorMessage || "logged_out"
+        });
+      }
 
       if (!shouldReconnect) {
         sessionData.status = "deslogado";
