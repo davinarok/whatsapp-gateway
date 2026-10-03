@@ -928,14 +928,27 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
 
       sessionData.status = "reiniciando";
       sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1;
-      const reconnectDelay = Math.min(3000 * sessionData.reconnectAttempts, 15000);
+      const resetUnregisteredAuth =
+        statusCode === 428 &&
+        state?.creds?.registered === false &&
+        sessionData.reconnectAttempts >= 2;
+      const reconnectDelay = resetUnregisteredAuth
+        ? 1000
+        : Math.min(3000 * sessionData.reconnectAttempts, 15000);
 
       clearReconnectTimer(sessionId);
 
       const timer = setTimeout(async () => {
         try {
-          console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
-          await closeSocketSafely(sessionData, false);
+          if (resetUnregisteredAuth) {
+            console.log(`Resetando credenciais incompletas da sessão ${sessionId} após erro 428 de pareamento`);
+            await closeSocketSafely(sessionData, false);
+            removeAuthFolder(sessionId);
+            sessionData.reconnectAttempts = 0;
+          } else {
+            console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
+            await closeSocketSafely(sessionData, false);
+          }
           await startWhatsAppSession({ sessionId, storeId, userId });
         } catch (error) {
           sessionData.status = "erro";
