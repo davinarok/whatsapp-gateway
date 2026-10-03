@@ -862,7 +862,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     auth: state,
     logger: pino({ level: "info" }),
     printQRInTerminal: false,
-    browser: Browsers.macOS("Desktop"),
+    browser: Browsers.ubuntu("Chrome"),
     // Solicita ao WhatsApp todo o histórico que ele disponibilizar ao dispositivo vinculado.
     syncFullHistory: true,
     shouldSyncHistoryMessage: () => true,
@@ -931,7 +931,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
       const resetUnregisteredAuth =
         statusCode === 428 &&
         state?.creds?.registered === false &&
-        sessionData.reconnectAttempts >= 2;
+        sessionData.reconnectAttempts === 2;
       const reconnectDelay = resetUnregisteredAuth
         ? 1000
         : Math.min(3000 * sessionData.reconnectAttempts, 15000);
