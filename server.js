@@ -445,24 +445,39 @@ async function getBufferFromMediaRequest(body) {
 }
 
 async function convertAudioToOggOpus(inputBuffer) {
-  const inputPath = path.join(os.tmpdir(), `audio-input-${randomUUID()}.webm`);
+  // Não confiar na extensão original: MediaRecorder varia entre webm/ogg/mp4
+  // conforme navegador/SO. FFmpeg detecta o container pelo conteúdo.
+  const inputPath = path.join(os.tmpdir(), `audio-input-${randomUUID()}`);
   const outputPath = path.join(os.tmpdir(), `audio-output-${randomUUID()}.ogg`);
   fs.writeFileSync(inputPath, inputBuffer);
 
   try {
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
+        .noVideo()
         .audioCodec("libopus")
         .audioBitrate("48k")
         .audioChannels(1)
+        // Voice notes do WhatsApp trabalham com Opus a 48 kHz.
+        .audioFrequency(48000)
         .format("ogg")
-        .outputOptions(["-vn", "-application", "voip"])
+        // Normaliza timestamps para evitar OGG/Opus aceito pelo servidor mas
+        // rejeitado por alguns decodificadores/clientes WhatsApp.
+        .outputOptions([
+          "-application", "voip",
+          "-avoid_negative_ts", "make_zero",
+          "-fflags", "+genpts"
+        ])
         .save(outputPath)
         .on("end", resolve)
         .on("error", reject);
     });
 
-    return fs.readFileSync(outputPath);
+    const converted = fs.readFileSync(outputPath);
+    if (converted.length < 64 || converted.subarray(0, 4).toString("ascii") !== "OggS") {
+      throw new Error("Conversão de áudio produziu OGG inválido");
+    }
+    return converted;
   } finally {
     try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch {}
     try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
