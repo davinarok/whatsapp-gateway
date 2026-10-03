@@ -42,6 +42,31 @@ const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 const sessions = new Map();
 const reconnectTimers = new Map();
 const lidToPhoneMap = new Map();
+const historyTrackers = new Map();
+
+function getHistoryTracker(sessionId, storeId) {
+  let tracker = historyTrackers.get(sessionId);
+  if (!tracker) {
+    tracker = { sessionId, storeId, batches: 0, received: 0, forwarded: 0, failed: 0, startedAt: new Date().toISOString(), timer: null };
+    historyTrackers.set(sessionId, tracker);
+  }
+  return tracker;
+}
+
+function scheduleHistoryCompletion(sessionId, storeId) {
+  const tracker = getHistoryTracker(sessionId, storeId);
+  if (tracker.timer) clearTimeout(tracker.timer);
+  tracker.timer = setTimeout(async () => {
+    await sendMessageToSystemWebhook({
+      tipo: "sync_historico_concluido", conta_id: storeId, store_id: storeId,
+      connection_type: "qr", session_id: sessionId,
+      mensagens_recebidas: tracker.received, mensagens_enviadas: tracker.forwarded,
+      falhas: tracker.failed, lotes: tracker.batches,
+      status: tracker.received > 0 ? "sincronizado" : "sem_resposta"
+    });
+  }, 5000);
+}
+
 
 function checkSecret(req, res, next) {
   const secret = req.headers["x-gateway-secret"];
@@ -648,7 +673,7 @@ async function forwardOfficialStatus({ req, value, status }) {
   return sendMessageToSystemWebhook(payload);
 }
 
-async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId }) {
+async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId, historySync = false }) {
   const messages = messageUpdate.messages || [];
   const sessionData = sessions.get(sessionId);
 
@@ -766,7 +791,8 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
             fileName: mediaInfo.media_message?.fileName || null,
             caption: mediaInfo.media_message?.caption || null
           } : null,
-          possible_jids_found: contactIdentity.possible_jids_found || []
+          possible_jids_found: contactIdentity.possible_jids_found || [],
+          history_sync: historySync
         }
       };
 
@@ -782,7 +808,13 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
         hasMediaBase64: Boolean(payload.media_base64), messageId
       });
 
-      await sendMessageToSystemWebhook(payload);
+      const forwarded = await sendMessageToSystemWebhook(payload);
+      if (historySync) {
+        const tracker = getHistoryTracker(sessionId, storeId);
+        tracker.received += 1;
+        if (forwarded) tracker.forwarded += 1;
+        else tracker.failed += 1;
+      }
     } catch (error) {
       console.log("Erro ao processar uma mensagem:", error.message);
     }
@@ -816,7 +848,9 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     logger: pino({ level: "info" }),
     printQRInTerminal: false,
     browser: Browsers.macOS("Desktop"),
-    syncFullHistory: false,
+    // Solicita ao WhatsApp todo o histórico que ele disponibilizar ao dispositivo vinculado.
+    syncFullHistory: true,
+    shouldSyncHistoryMessage: () => true,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000
   });
@@ -852,6 +886,14 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
       sessionData.reconnectAttempts = 0;
       clearReconnectTimer(sessionId);
       console.log(`Sessão ${sessionId} conectada`);
+      historyTrackers.set(sessionId, {
+        sessionId, storeId, batches: 0, received: 0, forwarded: 0, failed: 0,
+        startedAt: new Date().toISOString(), timer: null
+      });
+      await sendMessageToSystemWebhook({
+        tipo: "sync_historico_iniciado", conta_id: storeId, store_id: storeId,
+        connection_type: "qr", session_id: sessionId
+      });
     }
 
     if (connection === "close") {
@@ -892,7 +934,24 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   });
 
   sock.ev.on("messages.upsert", async (messageUpdate) => {
-    await processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId });
+    const historySync = messageUpdate.type === "append";
+    await processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId, historySync });
+    if (historySync) scheduleHistoryCompletion(sessionId, storeId);
+  });
+
+  // Histórico inicial disponibilizado pelo WhatsApp ao dispositivo recém-vinculado.
+  sock.ev.on("messaging-history.set", async ({ messages = [], chats = [], isLatest, progress, syncType }) => {
+    const tracker = getHistoryTracker(sessionId, storeId);
+    tracker.batches += 1;
+    await processIncomingOrOutgoingMessages({ messageUpdate: { messages }, sessionId, storeId, historySync: true });
+    await sendMessageToSystemWebhook({
+      tipo: "sync_historico_progresso", conta_id: storeId, store_id: storeId,
+      connection_type: "qr", session_id: sessionId,
+      conversas_recebidas: chats.length, mensagens_recebidas: tracker.received,
+      mensagens_enviadas: tracker.forwarded, falhas: tracker.failed,
+      progresso: progress ?? null, lote_final: Boolean(isLatest), sync_type: syncType ?? null
+    });
+    scheduleHistoryCompletion(sessionId, storeId);
   });
 
   return sessionData;
