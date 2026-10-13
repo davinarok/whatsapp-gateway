@@ -1135,6 +1135,50 @@ app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
   return res.json({ success: true, session_id: sessionId, message: "Sessão removida. Gere um novo QR Code." });
 });
 
+// Sincronização sob demanda, limitada aos chats com cursor observado.
+ // O protocolo Baileys não oferece download garantido de TODO o histórico de
+ // todas as conversas sem um cursor válido.
+app.post("/history/sync", checkSecret, async (req, res) => {
+  const sessionId = String(req.body?.session_id || "");
+  const session = sessions.get(sessionId);
+  if (!session || session.status !== "conectado" || !session.sock) {
+    return res.status(409).json({ ok: false, error: "Sessão QR não conectada", code: "qr_session_not_connected" });
+  }
+  if (typeof session.sock.fetchMessageHistory !== "function") {
+    return res.status(501).json({ ok: false, error: "Biblioteca não suporta busca de histórico sob demanda", code: "history_unavailable" });
+  }
+  const now = Date.now();
+  if (session.lastHistoryRequestAt && now - session.lastHistoryRequestAt < 60000) {
+    return res.status(429).json({ ok: false, error: "Aguarde 60 segundos antes de sincronizar novamente", code: "history_cooldown" });
+  }
+  const cursors = [...(session.recentMessageKeys?.values() || [])].slice(-15);
+  if (!cursors.length) {
+    return res.status(409).json({
+      ok: false, code: "history_requires_cursor",
+      error: "Ainda não há mensagens recentes com cursor disponível. O histórico prévio depende da sincronização fornecida pelo WhatsApp no pareamento."
+    });
+  }
+  session.lastHistoryRequestAt = now;
+  let requested = 0, failed = 0;
+  for (const { key, timestamp } of cursors) {
+    try {
+      const seconds = Math.floor(Date.parse(timestamp) / 1000);
+      if (!Number.isFinite(seconds)) { failed++; continue; }
+      await session.sock.fetchMessageHistory(25, key, seconds);
+      requested++;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } catch (error) {
+      failed++;
+      console.warn("Histórico sob demanda não aceito para um chat", { sessionId, error: error.message });
+    }
+  }
+  return res.status(requested ? 202 : 502).json({
+    ok: requested > 0, status: requested ? "solicitado" : "erro",
+    chats_solicitados: requested, chats_falharam: failed, limite_por_chat: 25,
+    aviso: "A entrega efetiva depende da resposta assíncrona do WhatsApp; progresso é recebido pelo webhook."
+  });
+});
+
 app.post("/messages/send", checkSecret, async (req, res) => {
   const { session_id, phone, contact_jid, message } = req.body;
 
