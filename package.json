@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node --max-old-space-size=3072 gateway-entry.js",
     "test": "node --test gateway.test.js",
-    "check": "node --check gateway-entry.js && node --check server.js && node --check session-registry.js && node --check webhook-outbox.js && node --check gateway.test.js"
+    "check": "node --check gateway-entry.js && node --check server.js && node --check session-registry.js && node --check webhook-outbox.js && node --check gateway.test.js && node --check media-retry-queue.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
