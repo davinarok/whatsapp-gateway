@@ -5,7 +5,9 @@
   "main": "gateway-entry.js",
   "type": "module",
   "scripts": {
-    "start": "node gateway-entry.js"
+    "start": "node --max-old-space-size=3072 gateway-entry.js",
+    "test": "node --test gateway.test.js",
+    "check": "node --check gateway-entry.js && node --check server.js && node --check session-registry.js && node --check webhook-outbox.js && node --check gateway.test.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
