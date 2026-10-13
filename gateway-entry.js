@@ -374,6 +374,20 @@ app.get("/", async (req, res) => {
   }
 });
 
+app.get("/sessions/diagnostics", checkSecret, async (_req, res) => {
+  const sessions = [];
+  for (const entry of sessionRegistry.entries()) {
+    try {
+      const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(toInternalSessionId(entry.id))}/status`, {
+        headers: { "x-gateway-secret": GATEWAY_SECRET }, signal: AbortSignal.timeout(3000)
+      });
+      const data = await response.json().catch(() => ({}));
+      sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: response.ok ? data.status : "ausente", http_status: response.status });
+    } catch { sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: "indisponivel", http_status: null }); }
+  }
+  return res.json({ status: "ok", sessions });
+});
+
 app.use(async (req, res) => {
   try {
     const targetUrl = `${internalBaseUrl}${req.originalUrl}`;
@@ -423,19 +437,7 @@ async function restorePersistedSessions() {
   }
 }
 
-app.get("/sessions/diagnostics", checkSecret, async (_req, res) => {
-  const sessions = [];
-  for (const entry of sessionRegistry.entries()) {
-    try {
-      const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(toInternalSessionId(entry.id))}/status`, {
-        headers: { "x-gateway-secret": GATEWAY_SECRET }, signal: AbortSignal.timeout(3000)
-      });
-      const data = await response.json().catch(() => ({}));
-      sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: response.ok ? data.status : "ausente", http_status: response.status });
-    } catch { sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: "indisponivel", http_status: null }); }
-  }
-  return res.json({ status: "ok", sessions });
-});
+
 
 await startInternalServer();
 
