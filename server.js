@@ -7,6 +7,9 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
+import { createPersistedLidMap } from "./session-registry.js";
+import { createWebhookOutbox } from "./webhook-outbox.js";
+import { createMediaRetryQueue } from "./media-retry-queue.js";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import makeWASocket, {
@@ -22,7 +25,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "90mb" }));
+app.use(express.json({ limit: "145mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_SECRET = process.env.WHATSAPP_GATEWAY_SECRET;
@@ -41,7 +44,11 @@ const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 
 const sessions = new Map();
 const reconnectTimers = new Map();
-const lidToPhoneMap = new Map();
+const lidToPhoneMap = createPersistedLidMap(AUTH_PATH);
+const webhookOutbox = createWebhookOutbox(AUTH_PATH);
+const mediaRetryQueue = createMediaRetryQueue(AUTH_PATH);
+const HISTORY_BATCH_SIZE = 25;
+const MAX_RECONNECT_ATTEMPTS = 8;
 const historyTrackers = new Map();
 
 function getHistoryTracker(sessionId, storeId) {
@@ -109,11 +116,11 @@ function isLidJid(value) {
   return String(value || "").endsWith("@lid");
 }
 
-function rememberLidPhoneMapping({ lid, phone, source = "unknown" }) {
+function rememberLidPhoneMapping({ lid, phone, source = "unknown", sessionId }) {
   const cleanLid = cleanLidFromJid(lid);
   const cleanPhone = cleanPhoneFromJid(phone);
-  if (!cleanLid || !cleanPhone) return;
-  lidToPhoneMap.set(cleanLid, cleanPhone);
+  if (!cleanLid || !cleanPhone || !sessionId) return;
+  lidToPhoneMap.set(`${sessionId}:${cleanLid}`, cleanPhone);
   console.log("Mapeamento LID -> telefone salvo em memória:", { lid: cleanLid, phone: cleanPhone, source });
 }
 
@@ -178,7 +185,7 @@ function extractPossibleJids(msg = {}, remoteJid = "") {
   return [...new Set([...directValues, ...deepByKey, ...deepStrings])];
 }
 
-function getContactIdentity(remoteJid, msg = {}) {
+function getContactIdentity(remoteJid, msg = {}, sessionId = null) {
   const cleanJid = String(remoteJid || "").trim();
   const possibleJids = extractPossibleJids(msg, cleanJid);
   const phoneJid = possibleJids.find(isPhoneJid);
@@ -186,10 +193,10 @@ function getContactIdentity(remoteJid, msg = {}) {
   const phone = phoneJid ? cleanPhoneFromJid(phoneJid) : null;
   const lid = lidJid ? cleanLidFromJid(lidJid) : isLidJid(cleanJid) ? cleanLidFromJid(cleanJid) : null;
 
-  if (lid && phone) rememberLidPhoneMapping({ lid, phone, source: "same_payload" });
+  if (lid && phone) rememberLidPhoneMapping({ lid, phone, source: "same_payload", sessionId });
 
   if (isLidJid(cleanJid)) {
-    const mappedPhone = lid ? lidToPhoneMap.get(lid) : null;
+    const mappedPhone = lid && sessionId ? lidToPhoneMap.get(`${sessionId}:${lid}`) : null;
     return {
       contact_phone: mappedPhone || null,
       contact_jid: mappedPhone ? `${mappedPhone}@s.whatsapp.net` : cleanJid,
@@ -340,13 +347,37 @@ async function sendMessageToSystemWebhook(payload) {
       body: JSON.stringify(payload)
     });
     const responseText = await response.text();
-    console.log("Resposta do webhook:", { status: response.status, ok: response.ok, body: responseText?.slice?.(0, 1000) || responseText });
+    if (!response.ok && !payload?.media_upload_init) {
+      try { webhookOutbox.enqueue(payload); }
+      catch (e) { console.error("Falha ao enfileirar callback", e.message); }
+      console.warn("Falha HTTP do webhook", { status: response.status, messageId: payload?.message_id || null });
+    }
     return { success: response.ok, status: response.status, body: responseText };
   } catch (error) {
+    if (!payload?.media_upload_init) {
+      try { webhookOutbox.enqueue(payload); }
+      catch (e) { console.error("Falha ao persistir callback", e.message); }
+    }
     console.log("Erro ao enviar mensagem para webhook:", error.message);
     return { success: false, error: error.message };
   }
 }
+async function resendPendingWebhooks() {
+  if (!SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return;
+  const stats = await webhookOutbox.drain(async (payload) => {
+    const response = await fetch(SYSTEM_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-webhook-secret": SYSTEM_WEBHOOK_SECRET },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(15000)
+    });
+    return response.ok;
+  });
+  if (stats.sent || stats.failed) console.log("Fila de callbacks", { ...stats, remaining: webhookOutbox.count() });
+}
+const webhookRetryTimer = setInterval(() => {
+  void resendPendingWebhooks().catch((e) => console.log("Retry de callbacks adiado", e.message));
+}, 30000);
+webhookRetryTimer.unref?.();
 
 async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
   const buffer = await downloadMediaMessage(
@@ -373,14 +404,15 @@ async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
   };
 }
 
-async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromMe, contactIdentity, contactName, timestamp, mediaPayload }) {
+async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromMe, contactIdentity, contactName, timestamp, mediaPayload, connectionType = "qr", phoneNumberId = null }) {
   if (!mediaPayload?.media_buffer || !SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return null;
   const initPayload = {
     tipo: "whatsapp_message",
     conta_id: storeId,
     store_id: storeId,
-    connection_type: "qr",
+    connection_type: connectionType,
     session_id: sessionId,
+    ...(phoneNumberId ? { phone_number_id: phoneNumberId } : {}),
     contact_phone: contactIdentity.contact_phone,
     contact_jid: contactIdentity.contact_jid,
     contact_lid: contactIdentity.contact_lid,
@@ -424,6 +456,61 @@ async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromM
   return slot.storage_path;
 }
 
+
+async function enqueueMediaForRetry(meta, mediaPayload) {
+  if (!mediaPayload?.media_buffer) return false;
+  try {
+    const registered = await mediaRetryQueue.enqueue({
+      ...meta,
+      mediaPayload: {
+        media_type: mediaPayload.media_type,
+        media_mime_type: mediaPayload.media_mime_type,
+        media_file_name: mediaPayload.media_file_name,
+        media_caption: mediaPayload.media_caption,
+        media_size_bytes: mediaPayload.media_size_bytes
+      }
+    }, mediaPayload.media_buffer);
+    if (!registered) console.warn("Mídia não cabe na fila local", { messageId: meta.messageId });
+    return registered;
+  } catch (e) {
+    console.warn("Erro ao salvar mídia para retry", { messageId: meta.messageId, error: e.message });
+    return false;
+  }
+}
+async function retryPendingMedia() {
+  if (!SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return;
+  const result = await mediaRetryQueue.drain(async (meta, buffer) => {
+    const storagePath = await persistIncomingMediaDirect({
+      ...meta,
+      mediaPayload: { ...meta.mediaPayload, media_buffer: buffer }
+    });
+    if (!storagePath) return false;
+    const response = await sendMessageToSystemWebhook({
+      tipo: "whatsapp_message", conta_id: meta.storeId, store_id: meta.storeId,
+      connection_type: meta.connectionType || "qr", session_id: meta.sessionId,
+      ...(meta.phoneNumberId ? { phone_number_id: meta.phoneNumberId } : {}),
+      contact_phone: meta.contactIdentity?.contact_phone || null,
+      contact_jid: meta.contactIdentity?.contact_jid || null,
+      contact_lid: meta.contactIdentity?.contact_lid || null,
+      contact_name: meta.contactName || null,
+      message_id: meta.messageId, from_me: meta.fromMe,
+      direction: meta.fromMe ? "outbound" : "inbound",
+      timestamp: meta.timestamp, message_type: "media",
+      media_type: meta.mediaPayload.media_type,
+      media_mime_type: meta.mediaPayload.media_mime_type,
+      media_file_name: meta.mediaPayload.media_file_name,
+      media_caption: meta.mediaPayload.media_caption,
+      media_size_bytes: meta.mediaPayload.media_size_bytes,
+      media_storage_path: storagePath
+    });
+    return response.success === true;
+  });
+  if (result.sent || result.failed) console.log("Retry de mídia", { ...result, pending: mediaRetryQueue.count() });
+}
+const mediaRetryInterval = setInterval(() => {
+  void retryPendingMedia().catch((e) => console.warn("Retry de mídia adiado", e.message));
+}, 60000);
+mediaRetryInterval.unref?.();
 
 async function getBufferFromMediaRequest(body) {
   if (body.media_base64) {
@@ -535,7 +622,7 @@ function extractOfficialMedia(message = {}) {
   };
 }
 
-async function downloadOfficialMediaAsBase64(mediaId, accessToken) {
+async function downloadOfficialMediaAsBuffer(mediaId, accessToken) {
   if (!mediaId || !accessToken) return null;
 
   const metaMediaResponse = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${mediaId}`, {
@@ -556,11 +643,13 @@ async function downloadOfficialMediaAsBase64(mediaId, accessToken) {
     throw new Error(`Erro ao baixar mídia oficial: HTTP ${fileResponse.status} ${errorText}`);
   }
 
+  const declaredBytes = Number(fileResponse.headers.get("content-length") || 0);
+  if (declaredBytes > MAX_MEDIA_SIZE_BYTES) throw new Error("Mídia oficial maior que o limite permitido");
   const buffer = Buffer.from(await fileResponse.arrayBuffer());
   if (buffer.length > MAX_MEDIA_SIZE_BYTES) throw new Error(`Mídia oficial excede o limite de ${MAX_MEDIA_SIZE_MB}MB`);
 
   return {
-    media_base64: buffer.toString("base64"),
+    media_buffer: buffer,
     media_size_bytes: buffer.length,
     media_mime_type: mediaMetadata.mime_type || fileResponse.headers.get("content-type") || null
   };
@@ -587,15 +676,46 @@ async function forwardOfficialMessage({ req, value, message, contact }) {
   const accessToken = req.headers["x-meta-access-token"] || META_ACCESS_TOKEN;
 
   let mediaPayload = {};
+  let officialStoragePath = null;
   if (officialMedia?.media_id) {
     try {
-      console.log("Mídia oficial recebida. Iniciando download:", { phoneNumberId, mediaId: officialMedia.media_id, type: message.type });
-      const downloaded = await downloadOfficialMediaAsBase64(officialMedia.media_id, accessToken);
-      mediaPayload = {
-        media_base64: downloaded?.media_base64 || null,
-        media_size_bytes: downloaded?.media_size_bytes || null,
-        media_mime_type: downloaded?.media_mime_type || officialMedia.media_mime_type || null
+      const downloaded = await downloadOfficialMediaAsBuffer(officialMedia.media_id, accessToken);
+      const mime = downloaded?.media_mime_type || officialMedia.media_mime_type || "application/octet-stream";
+      const tempMedia = {
+        media_buffer: downloaded.media_buffer,
+        media_size_bytes: downloaded.media_size_bytes,
+        media_mime_type: mime,
+        media_type: message.type,
+        media_file_name: officialMedia.media_file_name || `${message.type}-${message.id || Date.now()}`,
+        media_caption: officialMedia.media_caption
       };
+      try {
+        officialStoragePath = await persistIncomingMediaDirect({
+          sessionId: `official_${phoneNumberId || storeId}`,
+          storeId, messageId: message.id, fromMe: false,
+          contactIdentity: { contact_phone: contactPhone, contact_jid: contactPhone ? `${contactPhone}@s.whatsapp.net` : null, contact_lid: null },
+          contactName: contact?.profile?.name || null,
+          timestamp: getMetaTimestamp(message.timestamp),
+          mediaPayload: tempMedia, connectionType: "official", phoneNumberId
+        });
+      } catch (e) {
+        console.warn("Falha em upload direto de mídia oficial", { messageId: message.id, reason: e.message });
+        await enqueueMediaForRetry({
+          sessionId: `official_${phoneNumberId || storeId}`, storeId,
+          messageId: message.id, fromMe: false,
+          contactIdentity: { contact_phone: contactPhone, contact_jid: contactPhone ? `${contactPhone}@s.whatsapp.net` : null, contact_lid: null },
+          contactName: contact?.profile?.name || null,
+          timestamp: getMetaTimestamp(message.timestamp),
+          connectionType: "official", phoneNumberId
+        }, tempMedia);
+        if (downloaded.media_size_bytes <= 8 * 1024 * 1024) {
+          mediaPayload.media_base64 = downloaded.media_buffer.toString("base64");
+        } else {
+          mediaPayload.media_download_error = `Upload direto indisponível: ${e.message}`;
+        }
+      }
+      mediaPayload.media_size_bytes = downloaded.media_size_bytes;
+      mediaPayload.media_mime_type = mime;
     } catch (error) {
       mediaPayload = { media_download_error: error.message, media_mime_type: officialMedia.media_mime_type || null };
       console.log("Erro ao baixar mídia oficial:", { mediaId: officialMedia.media_id, error: error.message });
@@ -631,6 +751,7 @@ async function forwardOfficialMessage({ req, value, message, contact }) {
     media_caption: officialMedia?.media_caption || null,
     media_size_bytes: mediaPayload.media_size_bytes || null,
     media_base64: mediaPayload.media_base64 || null,
+    media_storage_path: officialStoragePath,
     media_download_error: mediaPayload.media_download_error || null,
     media_baileys_type: null,
 
@@ -699,12 +820,21 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       const remoteJid = msg.key?.remoteJid || "";
       const fromMe = Boolean(msg.key?.fromMe);
       const messageId = msg.key?.id || null;
-
       if (!remoteJid) continue;
+      if (sessionData && messageId && msg.messageTimestamp) {
+        if (!sessionData.recentMessageKeys) sessionData.recentMessageKeys = new Map();
+        sessionData.recentMessageKeys.delete(remoteJid);
+        sessionData.recentMessageKeys.set(remoteJid, {
+          key: msg.key, timestamp: getMessageTimestamp(msg.messageTimestamp)
+        });
+        while (sessionData.recentMessageKeys.size > 500) {
+          sessionData.recentMessageKeys.delete(sessionData.recentMessageKeys.keys().next().value);
+        }
+      }
       if (remoteJid.includes("@g.us")) { console.log("Mensagem de grupo ignorada:", remoteJid); continue; }
       if (remoteJid === "status@broadcast") continue;
 
-      const contactIdentity = getContactIdentity(remoteJid, msg);
+      const contactIdentity = getContactIdentity(remoteJid, msg, sessionId);
       const cleanMessage = unwrapMessage(msg.message);
       const messageText = extractMessageText(cleanMessage);
       const messageType = extractMessageType(cleanMessage);
@@ -735,8 +865,13 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
             });
           } catch (storageError) {
             console.log("Falha no arquivamento direto da mídia:", { messageId, error: storageError.message });
+            await enqueueMediaForRetry({
+              sessionId, storeId, messageId, fromMe, contactIdentity,
+              contactName: msg.pushName || null, timestamp: msgTimestamp,
+              connectionType: "qr"
+            }, mediaPayload);
             // Compatibilidade temporária somente para arquivos pequenos; arquivos grandes não viram JSON Base64 gigante.
-            if (mediaPayload.media_size_bytes <= 25 * 1024 * 1024) {
+            if (mediaPayload.media_size_bytes <= 8 * 1024 * 1024) {
               mediaPayload.media_base64 = mediaPayload.media_buffer.toString("base64");
             } else {
               mediaPayload.media_download_error = `storage direto falhou: ${storageError.message}`;
@@ -827,7 +962,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       if (historySync) {
         const tracker = getHistoryTracker(sessionId, storeId);
         tracker.received += 1;
-        if (forwarded) tracker.forwarded += 1;
+        if (forwarded?.success) tracker.forwarded += 1;
         else tracker.failed += 1;
       }
     } catch (error) {
@@ -843,7 +978,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     sessionData = {
       sessionId, storeId, userId: userId || null,
       status: "starting", qrCode: null, sock: null,
-      lastError: null, reconnectAttempts: 0
+      lastError: null, reconnectAttempts: 0, recentMessageKeys: new Map()
     };
     sessions.set(sessionId, sessionData);
   }
@@ -863,8 +998,9 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     logger: pino({ level: "info" }),
     printQRInTerminal: false,
     browser: Browsers.ubuntu("Chrome"),
-    // Solicita ao WhatsApp todo o histórico que ele disponibilizar ao dispositivo vinculado.
-    syncFullHistory: true,
+    // Importação integral automática é opt-in: evita OOM em reinícios.
+    // Replay de eventos offline continua aceito.
+    syncFullHistory: process.env.WHATSAPP_SYNC_FULL_HISTORY === "true",
     shouldSyncHistoryMessage: () => true,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000
@@ -875,6 +1011,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
+    if (sessionData.sock !== sock) return; // ignora eventos tardios de socket antigo
     const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
 
     console.log("Connection update:", {
@@ -926,29 +1063,23 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
         return;
       }
 
-      sessionData.status = "reiniciando";
+      // Jamais apagar arquivos de auth automaticamente (inclusive erro 428).
+      if (sessionData.status === "reiniciando" && reconnectTimers.has(sessionId)) return;
       sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1;
-      const resetUnregisteredAuth =
-        statusCode === 428 &&
-        state?.creds?.registered === false &&
-        sessionData.reconnectAttempts === 2;
-      const reconnectDelay = resetUnregisteredAuth
-        ? 1000
-        : Math.min(3000 * sessionData.reconnectAttempts, 15000);
+      if (sessionData.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        sessionData.status = "desconectado";
+        console.warn("Limite de reconexões QR, aguardando intervenção", { sessionId, attempts: sessionData.reconnectAttempts });
+        return;
+      }
+      sessionData.status = "reiniciando";
+      const reconnectDelay = Math.min(3000 * 2 ** (sessionData.reconnectAttempts - 1), 60000);
 
       clearReconnectTimer(sessionId);
 
       const timer = setTimeout(async () => {
         try {
-          if (resetUnregisteredAuth) {
-            console.log(`Resetando credenciais incompletas da sessão ${sessionId} após erro 428 de pareamento`);
-            await closeSocketSafely(sessionData, false);
-            removeAuthFolder(sessionId);
-            sessionData.reconnectAttempts = 0;
-          } else {
-            console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
-            await closeSocketSafely(sessionData, false);
-          }
+          console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
+          await closeSocketSafely(sessionData, false);
           await startWhatsAppSession({ sessionId, storeId, userId });
         } catch (error) {
           sessionData.status = "erro";
@@ -963,7 +1094,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
 
   sock.ev.on("messages.upsert", async (messageUpdate) => {
     const historySync = messageUpdate.type === "append";
-    await processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId, historySync });
+    for (let i = 0; i < (messageUpdate.messages || []).length; i += HISTORY_BATCH_SIZE) {
+      await processIncomingOrOutgoingMessages({
+        messageUpdate: { messages: messageUpdate.messages.slice(i, i + HISTORY_BATCH_SIZE) },
+        sessionId, storeId, historySync
+      });
+      if (historySync) await new Promise((resolve) => setImmediate(resolve));
+    }
     if (historySync) scheduleHistoryCompletion(sessionId, storeId);
   });
 
@@ -971,7 +1108,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   sock.ev.on("messaging-history.set", async ({ messages = [], chats = [], isLatest, progress, syncType }) => {
     const tracker = getHistoryTracker(sessionId, storeId);
     tracker.batches += 1;
-    await processIncomingOrOutgoingMessages({ messageUpdate: { messages }, sessionId, storeId, historySync: true });
+    for (let i = 0; i < messages.length; i += HISTORY_BATCH_SIZE) {
+      await processIncomingOrOutgoingMessages({
+        messageUpdate: { messages: messages.slice(i, i + HISTORY_BATCH_SIZE) },
+        sessionId, storeId, historySync: true
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     await sendMessageToSystemWebhook({
       tipo: "sync_historico_progresso", conta_id: storeId, store_id: storeId,
       connection_type: "qr", session_id: sessionId,
@@ -993,6 +1136,9 @@ app.get("/", (req, res) => {
     media_enabled: true,
     max_media_size_mb: MAX_MEDIA_SIZE_MB,
     lid_phone_mappings_count: lidToPhoneMap.size,
+    webhooks_pending: webhookOutbox.count(),
+    qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
+    media_upload_pending: mediaRetryQueue.count(),
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN),
     routes: [
@@ -1017,6 +1163,9 @@ app.get("/health", (req, res) => {
     media_enabled: true,
     max_media_size_mb: MAX_MEDIA_SIZE_MB,
     lid_phone_mappings_count: lidToPhoneMap.size,
+    webhooks_pending: webhookOutbox.count(),
+    qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
+    media_upload_pending: mediaRetryQueue.count(),
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN)
   });
@@ -1037,6 +1186,18 @@ app.post("/sessions", checkSecret, async (req, res) => {
       qr_code: existingSession.qrCode || null,
       last_error: existingSession.lastError || null
     });
+  }
+
+  // Nova tentativa explícita (botão Gerar QR / Retomar): se o WhatsApp já
+  // declarou logout definitivo, as credenciais antigas não são reutilizáveis.
+  // A limpeza acontece SOMENTE nesta chamada autenticada, nunca no auto-retry.
+  if (existingSession?.status === "deslogado") {
+    await closeSocketSafely(existingSession, false);
+    removeAuthFolder(sessionId);
+    existingSession.reconnectAttempts = 0;
+  } else if (existingSession && ["erro", "desconectado"].includes(existingSession.status)) {
+    existingSession.reconnectAttempts = 0;
+    await closeSocketSafely(existingSession, false);
   }
 
   try {
@@ -1085,6 +1246,50 @@ app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
   return res.json({ success: true, session_id: sessionId, message: "Sessão removida. Gere um novo QR Code." });
 });
 
+// Sincronização sob demanda, limitada aos chats com cursor observado.
+ // O protocolo Baileys não oferece download garantido de TODO o histórico de
+ // todas as conversas sem um cursor válido.
+app.post("/history/sync", checkSecret, async (req, res) => {
+  const sessionId = String(req.body?.session_id || "");
+  const session = sessions.get(sessionId);
+  if (!session || session.status !== "conectado" || !session.sock) {
+    return res.status(409).json({ ok: false, error: "Sessão QR não conectada", code: "qr_session_not_connected" });
+  }
+  if (typeof session.sock.fetchMessageHistory !== "function") {
+    return res.status(501).json({ ok: false, error: "Biblioteca não suporta busca de histórico sob demanda", code: "history_unavailable" });
+  }
+  const now = Date.now();
+  if (session.lastHistoryRequestAt && now - session.lastHistoryRequestAt < 60000) {
+    return res.status(429).json({ ok: false, error: "Aguarde 60 segundos antes de sincronizar novamente", code: "history_cooldown" });
+  }
+  const cursors = [...(session.recentMessageKeys?.values() || [])].slice(-15);
+  if (!cursors.length) {
+    return res.status(409).json({
+      ok: false, code: "history_requires_cursor",
+      error: "Ainda não há mensagens recentes com cursor disponível. O histórico prévio depende da sincronização fornecida pelo WhatsApp no pareamento."
+    });
+  }
+  session.lastHistoryRequestAt = now;
+  let requested = 0, failed = 0;
+  for (const { key, timestamp } of cursors) {
+    try {
+      const seconds = Math.floor(Date.parse(timestamp) / 1000);
+      if (!Number.isFinite(seconds)) { failed++; continue; }
+      await session.sock.fetchMessageHistory(25, key, seconds);
+      requested++;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } catch (error) {
+      failed++;
+      console.warn("Histórico sob demanda não aceito para um chat", { sessionId, error: error.message });
+    }
+  }
+  return res.status(requested ? 202 : 502).json({
+    ok: requested > 0, status: requested ? "solicitado" : "erro",
+    chats_solicitados: requested, chats_falharam: failed, limite_por_chat: 25,
+    aviso: "A entrega efetiva depende da resposta assíncrona do WhatsApp; progresso é recebido pelo webhook."
+  });
+});
+
 app.post("/messages/send", checkSecret, async (req, res) => {
   const { session_id, phone, contact_jid, message } = req.body;
 
@@ -1109,7 +1314,7 @@ app.post("/messages/send", checkSecret, async (req, res) => {
     if (!jid) return res.status(400).json({ error: "Destino inválido. Informe um telefone real ou um JID @s.whatsapp.net.", code: "invalid_destination" });
 
     const result = await sessionData.sock.sendMessage(jid, { text: message });
-    console.log("Mensagem enviada pelo endpoint:", { session_id, phone, contact_jid, jid, message, result });
+    console.log("Mensagem enviada pelo endpoint:", { session_id, jid, messageId: result?.key?.id || null });
 
     return res.json({
       success: true,
@@ -1117,7 +1322,7 @@ app.post("/messages/send", checkSecret, async (req, res) => {
       message_id: result?.key?.id || null,
       from_me: result?.key?.fromMe || null,
       status: result?.status || null,
-      raw_result: result
+      raw_result: { key: result?.key || null, status: result?.status || null }
     });
   } catch (error) {
     return res.status(500).json({ error: "Erro ao enviar mensagem", details: error.message });
@@ -1172,7 +1377,7 @@ app.post("/messages/send-media", checkSecret, async (req, res) => {
       media_type,
       media_mime_type: media_mime_type || null,
       media_file_name: media_file_name || null,
-      raw_result: result
+      raw_result: { key: result?.key || null, status: result?.status || null }
     });
   } catch (error) {
     console.log("Erro ao enviar mídia:", error.message);
@@ -1197,7 +1402,7 @@ app.get("/official/webhook", (req, res) => {
 
 app.post("/official/webhook", async (req, res) => {
   try {
-    console.log("Webhook oficial Meta recebido:", JSON.stringify(req.body, null, 2));
+    console.log("Webhook oficial Meta recebido:", { entryCount: req.body?.entry?.length || 0 });
 
     const tasks = [];
 
@@ -1497,6 +1702,16 @@ app.post("/official/messages/send-media", checkSecret, async (req, res) => {
     });
   }
 });
+
+const initialMediaRetry = setTimeout(() => {
+  void retryPendingMedia().catch((e) => console.warn("Retry de mídia inicial adiado", e.message));
+}, 10000);
+initialMediaRetry.unref?.();
+
+const initialWebhookRetry = setTimeout(() => {
+  void resendPendingWebhooks().catch((e) => console.log("Retry inicial adiado", e.message));
+}, 5000);
+initialWebhookRetry.unref?.();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`WhatsApp Gateway rodando na porta ${PORT}`);

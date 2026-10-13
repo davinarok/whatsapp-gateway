@@ -1,0 +1,50 @@
+name: WhatsApp gateway validation
+
+on:
+  push:
+    branches:
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  gateway-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package.json
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Check syntax
+        run: npm run check
+      - name: Unit regression tests
+        run: npm test
+      - name: Start and smoke-test proxy without WhatsApp sessions
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WHATSAPP_GATEWAY_SECRET="ci-test-only-secret"
+          export PORT=3101
+          export INTERNAL_SERVER_PORT=3102
+          export AUTH_PATH="$(mktemp -d)"
+          node gateway-entry.js > /tmp/gateway-smoke.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; cat /tmp/gateway-smoke.log' EXIT
+          READY=0
+          for i in $(seq 1 30); do
+            if curl --max-time 2 -fsS http://127.0.0.1:3101/health >/tmp/gateway-health.json; then READY=1; break; fi
+            sleep 1
+          done
+          test "$READY" -eq 1
+          node -e 'const h=require("/tmp/gateway-health.json"); if(h.status!=="online") process.exit(1)'
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3101/sessions/diagnostics)
+          test "$STATUS" -eq 401
+          curl -fsS -H 'x-gateway-secret: ci-test-only-secret' http://127.0.0.1:3101/sessions/diagnostics >/tmp/gateway-diag.json
+          node -e 'const r=require("/tmp/gateway-diag.json"); if(r.status!=="ok"||!Array.isArray(r.sessions)) process.exit(1)'
