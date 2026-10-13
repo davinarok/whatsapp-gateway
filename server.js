@@ -114,11 +114,11 @@ function isLidJid(value) {
   return String(value || "").endsWith("@lid");
 }
 
-function rememberLidPhoneMapping({ lid, phone, source = "unknown" }) {
+function rememberLidPhoneMapping({ lid, phone, source = "unknown", sessionId }) {
   const cleanLid = cleanLidFromJid(lid);
   const cleanPhone = cleanPhoneFromJid(phone);
-  if (!cleanLid || !cleanPhone) return;
-  lidToPhoneMap.set(cleanLid, cleanPhone);
+  if (!cleanLid || !cleanPhone || !sessionId) return;
+  lidToPhoneMap.set(`${sessionId}:${cleanLid}`, cleanPhone);
   console.log("Mapeamento LID -> telefone salvo em memória:", { lid: cleanLid, phone: cleanPhone, source });
 }
 
@@ -183,7 +183,7 @@ function extractPossibleJids(msg = {}, remoteJid = "") {
   return [...new Set([...directValues, ...deepByKey, ...deepStrings])];
 }
 
-function getContactIdentity(remoteJid, msg = {}) {
+function getContactIdentity(remoteJid, msg = {}, sessionId = null) {
   const cleanJid = String(remoteJid || "").trim();
   const possibleJids = extractPossibleJids(msg, cleanJid);
   const phoneJid = possibleJids.find(isPhoneJid);
@@ -191,10 +191,10 @@ function getContactIdentity(remoteJid, msg = {}) {
   const phone = phoneJid ? cleanPhoneFromJid(phoneJid) : null;
   const lid = lidJid ? cleanLidFromJid(lidJid) : isLidJid(cleanJid) ? cleanLidFromJid(cleanJid) : null;
 
-  if (lid && phone) rememberLidPhoneMapping({ lid, phone, source: "same_payload" });
+  if (lid && phone) rememberLidPhoneMapping({ lid, phone, source: "same_payload", sessionId });
 
   if (isLidJid(cleanJid)) {
-    const mappedPhone = lid ? lidToPhoneMap.get(lid) : null;
+    const mappedPhone = lid && sessionId ? lidToPhoneMap.get(`${sessionId}:${lid}`) : null;
     return {
       contact_phone: mappedPhone || null,
       contact_jid: mappedPhone ? `${mappedPhone}@s.whatsapp.net` : cleanJid,
@@ -769,7 +769,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       if (remoteJid.includes("@g.us")) { console.log("Mensagem de grupo ignorada:", remoteJid); continue; }
       if (remoteJid === "status@broadcast") continue;
 
-      const contactIdentity = getContactIdentity(remoteJid, msg);
+      const contactIdentity = getContactIdentity(remoteJid, msg, sessionId);
       const cleanMessage = unwrapMessage(msg.message);
       const messageText = extractMessageText(cleanMessage);
       const messageType = extractMessageType(cleanMessage);
@@ -1318,7 +1318,7 @@ app.get("/official/webhook", (req, res) => {
 
 app.post("/official/webhook", async (req, res) => {
   try {
-    console.log("Webhook oficial Meta recebido:", JSON.stringify(req.body, null, 2));
+    console.log("Webhook oficial Meta recebido:", { entryCount: req.body?.entry?.length || 0 });
 
     const tasks = [];
 
