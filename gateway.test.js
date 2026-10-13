@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createSessionRegistry, createPersistedLidMap } from "./session-registry.js";
 import { createWebhookOutbox } from "./webhook-outbox.js";
+import { createMediaRetryQueue } from "./media-retry-queue.js";
 
 const STORE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CONN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -79,4 +80,27 @@ test("legacy routes keep the correct gateway authentication and never auto logou
   assert.match(server, /webhookOutbox\.enqueue/);
   assert.doesNotMatch(server, /Resetando credenciais incompletas/);
   assert.match(server, /persistIncomingMediaDirect\(\{/);
+});
+
+test("media retry queue keeps binary bytes on disk across instances and cleans after delivery", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-media-"));
+  try {
+    const first = createMediaRetryQueue(dir, { maxPendingBytes: 32 });
+    assert.equal(await first.enqueue({ messageId: "media-1" }, Buffer.from("abc")), true);
+    assert.equal(first.count(), 1);
+    const second = createMediaRetryQueue(dir, { maxPendingBytes: 32 });
+    let attempts = 0;
+    const result1 = await second.drain(async (meta, bytes) => {
+      attempts++;
+      assert.equal(meta.messageId, "media-1");
+      assert.equal(bytes.toString(), "abc");
+      return false;
+    });
+    assert.equal(result1.failed, 1);
+    assert.equal(second.count(), 1);
+    const result2 = await second.drain(async () => true);
+    assert.equal(result2.sent, 1);
+    assert.equal(second.count(), 0);
+    assert.equal(await second.enqueue({ messageId: "too-big" }, Buffer.alloc(33)), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
