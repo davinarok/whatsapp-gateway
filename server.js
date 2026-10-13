@@ -9,6 +9,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { createPersistedLidMap } from "./session-registry.js";
 import { createWebhookOutbox } from "./webhook-outbox.js";
+import { createMediaRetryQueue } from "./media-retry-queue.js";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import makeWASocket, {
@@ -45,6 +46,7 @@ const sessions = new Map();
 const reconnectTimers = new Map();
 const lidToPhoneMap = createPersistedLidMap(AUTH_PATH);
 const webhookOutbox = createWebhookOutbox(AUTH_PATH);
+const mediaRetryQueue = createMediaRetryQueue(AUTH_PATH);
 const HISTORY_BATCH_SIZE = 25;
 const MAX_RECONNECT_ATTEMPTS = 8;
 const historyTrackers = new Map();
@@ -454,6 +456,61 @@ async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromM
   return slot.storage_path;
 }
 
+
+async function enqueueMediaForRetry(meta, mediaPayload) {
+  if (!mediaPayload?.media_buffer) return false;
+  try {
+    const registered = await mediaRetryQueue.enqueue({
+      ...meta,
+      mediaPayload: {
+        media_type: mediaPayload.media_type,
+        media_mime_type: mediaPayload.media_mime_type,
+        media_file_name: mediaPayload.media_file_name,
+        media_caption: mediaPayload.media_caption,
+        media_size_bytes: mediaPayload.media_size_bytes
+      }
+    }, mediaPayload.media_buffer);
+    if (!registered) console.warn("Mídia não cabe na fila local", { messageId: meta.messageId });
+    return registered;
+  } catch (e) {
+    console.warn("Erro ao salvar mídia para retry", { messageId: meta.messageId, error: e.message });
+    return false;
+  }
+}
+async function retryPendingMedia() {
+  if (!SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return;
+  const result = await mediaRetryQueue.drain(async (meta, buffer) => {
+    const storagePath = await persistIncomingMediaDirect({
+      ...meta,
+      mediaPayload: { ...meta.mediaPayload, media_buffer: buffer }
+    });
+    if (!storagePath) return false;
+    const response = await sendMessageToSystemWebhook({
+      tipo: "whatsapp_message", conta_id: meta.storeId, store_id: meta.storeId,
+      connection_type: meta.connectionType || "qr", session_id: meta.sessionId,
+      ...(meta.phoneNumberId ? { phone_number_id: meta.phoneNumberId } : {}),
+      contact_phone: meta.contactIdentity?.contact_phone || null,
+      contact_jid: meta.contactIdentity?.contact_jid || null,
+      contact_lid: meta.contactIdentity?.contact_lid || null,
+      contact_name: meta.contactName || null,
+      message_id: meta.messageId, from_me: meta.fromMe,
+      direction: meta.fromMe ? "outbound" : "inbound",
+      timestamp: meta.timestamp, message_type: "media",
+      media_type: meta.mediaPayload.media_type,
+      media_mime_type: meta.mediaPayload.media_mime_type,
+      media_file_name: meta.mediaPayload.media_file_name,
+      media_caption: meta.mediaPayload.media_caption,
+      media_size_bytes: meta.mediaPayload.media_size_bytes,
+      media_storage_path: storagePath
+    });
+    return response.success === true;
+  });
+  if (result.sent || result.failed) console.log("Retry de mídia", { ...result, pending: mediaRetryQueue.count() });
+}
+const mediaRetryInterval = setInterval(() => {
+  void retryPendingMedia().catch((e) => console.warn("Retry de mídia adiado", e.message));
+}, 60000);
+mediaRetryInterval.unref?.();
 
 async function getBufferFromMediaRequest(body) {
   if (body.media_base64) {
@@ -1068,6 +1125,7 @@ app.get("/", (req, res) => {
     lid_phone_mappings_count: lidToPhoneMap.size,
     webhooks_pending: webhookOutbox.count(),
     qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
+    media_upload_pending: mediaRetryQueue.count(),
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN),
     routes: [
@@ -1094,6 +1152,7 @@ app.get("/health", (req, res) => {
     lid_phone_mappings_count: lidToPhoneMap.size,
     webhooks_pending: webhookOutbox.count(),
     qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
+    media_upload_pending: mediaRetryQueue.count(),
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN)
   });
@@ -1618,6 +1677,11 @@ app.post("/official/messages/send-media", checkSecret, async (req, res) => {
     });
   }
 });
+
+const initialMediaRetry = setTimeout(() => {
+  void retryPendingMedia().catch((e) => console.warn("Retry de mídia inicial adiado", e.message));
+}, 10000);
+initialMediaRetry.unref?.();
 
 const initialWebhookRetry = setTimeout(() => {
   void resendPendingWebhooks().catch((e) => console.log("Retry inicial adiado", e.message));
