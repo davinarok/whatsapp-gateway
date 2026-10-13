@@ -32,18 +32,22 @@ test("registry can remove one connection without affecting others", () => sandbo
   assert.equal(createSessionRegistry(dir).get(OTHER).storeId, STORE);
 }));
 
-test("LID mappings persist, validate inputs and limit entries", () => sandbox((dir) => {
-  const a = createPersistedLidMap(dir, 2);
-  a.set("111111111", "5511999999999");
-  a.set("222222222", "5511888888888");
-  a.set("333333333", "5511777777777");
+test("LID mappings are isolated per QR session and survive restart", () => sandbox((dir) => {
+  const a = createPersistedLidMap(dir, 3);
+  const lid = "111111111";
+  const namespace1 = `store_${CONN}:${lid}`;
+  const namespace2 = `store_${OTHER}:${lid}`;
+  a.set(namespace1, "5511999999999");
+  a.set(namespace2, "5511888888888");
   a.set("bad", "not-a-phone");
   a.flush();
-  const b = createPersistedLidMap(dir, 2);
+  const b = createPersistedLidMap(dir, 3);
   assert.equal(b.size, 2);
-  assert.equal(b.get("111111111"), undefined);
-  assert.equal(b.get("333333333"), "5511777777777");
+  assert.equal(b.get(namespace1), "5511999999999");
+  assert.equal(b.get(namespace2), "5511888888888");
+  assert.equal(b.get(lid), undefined);
 }));
+
 
 test("outbox retains failed messages, retries without duplication", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-outbox-"));
