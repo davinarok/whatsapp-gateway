@@ -7,6 +7,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
+import { createPersistedLidMap } from "./session-registry.js";
+import { createWebhookOutbox } from "./webhook-outbox.js";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import makeWASocket, {
@@ -22,7 +24,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "90mb" }));
+app.use(express.json({ limit: "145mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_SECRET = process.env.WHATSAPP_GATEWAY_SECRET;
@@ -41,7 +43,10 @@ const MAX_MEDIA_SIZE_BYTES = MAX_MEDIA_SIZE_MB * 1024 * 1024;
 
 const sessions = new Map();
 const reconnectTimers = new Map();
-const lidToPhoneMap = new Map();
+const lidToPhoneMap = createPersistedLidMap(AUTH_PATH);
+const webhookOutbox = createWebhookOutbox(AUTH_PATH);
+const HISTORY_BATCH_SIZE = 25;
+const MAX_RECONNECT_ATTEMPTS = 8;
 const historyTrackers = new Map();
 
 function getHistoryTracker(sessionId, storeId) {
@@ -340,13 +345,37 @@ async function sendMessageToSystemWebhook(payload) {
       body: JSON.stringify(payload)
     });
     const responseText = await response.text();
-    console.log("Resposta do webhook:", { status: response.status, ok: response.ok, body: responseText?.slice?.(0, 1000) || responseText });
+    if (!response.ok && !payload?.media_upload_init) {
+      try { webhookOutbox.enqueue(payload); }
+      catch (e) { console.error("Falha ao enfileirar callback", e.message); }
+      console.warn("Falha HTTP do webhook", { status: response.status, messageId: payload?.message_id || null });
+    }
     return { success: response.ok, status: response.status, body: responseText };
   } catch (error) {
+    if (!payload?.media_upload_init) {
+      try { webhookOutbox.enqueue(payload); }
+      catch (e) { console.error("Falha ao persistir callback", e.message); }
+    }
     console.log("Erro ao enviar mensagem para webhook:", error.message);
     return { success: false, error: error.message };
   }
 }
+async function resendPendingWebhooks() {
+  if (!SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return;
+  const stats = await webhookOutbox.drain(async (payload) => {
+    const response = await fetch(SYSTEM_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-webhook-secret": SYSTEM_WEBHOOK_SECRET },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(15000)
+    });
+    return response.ok;
+  });
+  if (stats.sent || stats.failed) console.log("Fila de callbacks", { ...stats, remaining: webhookOutbox.count() });
+}
+const webhookRetryTimer = setInterval(() => {
+  void resendPendingWebhooks().catch((e) => console.log("Retry de callbacks adiado", e.message));
+}, 30000);
+webhookRetryTimer.unref?.();
 
 async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
   const buffer = await downloadMediaMessage(
@@ -736,7 +765,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
           } catch (storageError) {
             console.log("Falha no arquivamento direto da mídia:", { messageId, error: storageError.message });
             // Compatibilidade temporária somente para arquivos pequenos; arquivos grandes não viram JSON Base64 gigante.
-            if (mediaPayload.media_size_bytes <= 25 * 1024 * 1024) {
+            if (mediaPayload.media_size_bytes <= 8 * 1024 * 1024) {
               mediaPayload.media_base64 = mediaPayload.media_buffer.toString("base64");
             } else {
               mediaPayload.media_download_error = `storage direto falhou: ${storageError.message}`;
@@ -827,7 +856,7 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       if (historySync) {
         const tracker = getHistoryTracker(sessionId, storeId);
         tracker.received += 1;
-        if (forwarded) tracker.forwarded += 1;
+        if (forwarded?.success) tracker.forwarded += 1;
         else tracker.failed += 1;
       }
     } catch (error) {
@@ -843,7 +872,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     sessionData = {
       sessionId, storeId, userId: userId || null,
       status: "starting", qrCode: null, sock: null,
-      lastError: null, reconnectAttempts: 0
+      lastError: null, reconnectAttempts: 0, recentMessageKeys: new Map()
     };
     sessions.set(sessionId, sessionData);
   }
@@ -863,8 +892,9 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
     logger: pino({ level: "info" }),
     printQRInTerminal: false,
     browser: Browsers.ubuntu("Chrome"),
-    // Solicita ao WhatsApp todo o histórico que ele disponibilizar ao dispositivo vinculado.
-    syncFullHistory: true,
+    // Importação integral automática é opt-in: evita OOM em reinícios.
+    // Replay de eventos offline continua aceito.
+    syncFullHistory: process.env.WHATSAPP_SYNC_FULL_HISTORY === "true",
     shouldSyncHistoryMessage: () => true,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000
@@ -875,6 +905,7 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
+    if (sessionData.sock !== sock) return; // ignora eventos tardios de socket antigo
     const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
 
     console.log("Connection update:", {
@@ -926,29 +957,23 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
         return;
       }
 
-      sessionData.status = "reiniciando";
+      // Jamais apagar arquivos de auth automaticamente (inclusive erro 428).
+      if (sessionData.status === "reiniciando" && reconnectTimers.has(sessionId)) return;
       sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1;
-      const resetUnregisteredAuth =
-        statusCode === 428 &&
-        state?.creds?.registered === false &&
-        sessionData.reconnectAttempts === 2;
-      const reconnectDelay = resetUnregisteredAuth
-        ? 1000
-        : Math.min(3000 * sessionData.reconnectAttempts, 15000);
+      if (sessionData.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        sessionData.status = "desconectado";
+        console.warn("Limite de reconexões QR, aguardando intervenção", { sessionId, attempts: sessionData.reconnectAttempts });
+        return;
+      }
+      sessionData.status = "reiniciando";
+      const reconnectDelay = Math.min(3000 * 2 ** (sessionData.reconnectAttempts - 1), 60000);
 
       clearReconnectTimer(sessionId);
 
       const timer = setTimeout(async () => {
         try {
-          if (resetUnregisteredAuth) {
-            console.log(`Resetando credenciais incompletas da sessão ${sessionId} após erro 428 de pareamento`);
-            await closeSocketSafely(sessionData, false);
-            removeAuthFolder(sessionId);
-            sessionData.reconnectAttempts = 0;
-          } else {
-            console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
-            await closeSocketSafely(sessionData, false);
-          }
+          console.log(`Tentando reconectar sessão ${sessionId}. Tentativa ${sessionData.reconnectAttempts}`);
+          await closeSocketSafely(sessionData, false);
           await startWhatsAppSession({ sessionId, storeId, userId });
         } catch (error) {
           sessionData.status = "erro";
