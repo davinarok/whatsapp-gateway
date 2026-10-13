@@ -700,6 +700,14 @@ async function forwardOfficialMessage({ req, value, message, contact }) {
         });
       } catch (e) {
         console.warn("Falha em upload direto de mídia oficial", { messageId: message.id, reason: e.message });
+        await enqueueMediaForRetry({
+          sessionId: `official_${phoneNumberId || storeId}`, storeId,
+          messageId: message.id, fromMe: false,
+          contactIdentity: { contact_phone: contactPhone, contact_jid: contactPhone ? `${contactPhone}@s.whatsapp.net` : null, contact_lid: null },
+          contactName: contact?.profile?.name || null,
+          timestamp: getMetaTimestamp(message.timestamp),
+          connectionType: "official", phoneNumberId
+        }, tempMedia);
         if (downloaded.media_size_bytes <= 8 * 1024 * 1024) {
           mediaPayload.media_base64 = downloaded.media_buffer.toString("base64");
         } else {
@@ -857,6 +865,11 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
             });
           } catch (storageError) {
             console.log("Falha no arquivamento direto da mídia:", { messageId, error: storageError.message });
+            await enqueueMediaForRetry({
+              sessionId, storeId, messageId, fromMe, contactIdentity,
+              contactName: msg.pushName || null, timestamp: msgTimestamp,
+              connectionType: "qr"
+            }, mediaPayload);
             // Compatibilidade temporária somente para arquivos pequenos; arquivos grandes não viram JSON Base64 gigante.
             if (mediaPayload.media_size_bytes <= 8 * 1024 * 1024) {
               mediaPayload.media_base64 = mediaPayload.media_buffer.toString("base64");
