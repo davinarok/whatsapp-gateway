@@ -252,6 +252,23 @@ app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
   }
 });
 
+// Compatibilidade com a Edge Function já publicada: usa conta_id e
+// x-whatsapp-api-secret; a sessão interna continua canônica por conexão.
+app.post("/history/sync", async (req, res) => {
+  const supplied = req.headers["x-whatsapp-api-secret"] || req.headers["x-gateway-secret"];
+  if (!GATEWAY_SECRET || supplied !== GATEWAY_SECRET) {
+    return res.status(401).json({ ok: false, error: "Não autorizado" });
+  }
+  const data = parseJsonBody(req);
+  if (!data) return res.status(400).json({ ok: false, error: "JSON inválido" });
+  const id = String(data.conta_id || data.connection_id || data.session_id || "");
+  if (!isUuidLike(id) || !sessionRegistry.get(id)) {
+    return res.status(404).json({ ok: false, error: "Conexão QR não registrada no gateway" });
+  }
+  req.headers["x-gateway-secret"] = GATEWAY_SECRET;
+  return proxyJsonRequest({ req, res, targetPath: "/history/sync", body: { ...data, session_id: toInternalSessionId(id) } });
+});
+
 app.post(["/messages/send", "/messages/send-media"], checkSecret, async (req, res) => {
   const body = parseJsonBody(req);
   if (!body) return res.status(400).json({ success: false, error: "JSON inválido" });
