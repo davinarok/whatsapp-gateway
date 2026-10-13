@@ -728,8 +728,17 @@ async function processIncomingOrOutgoingMessages({ messageUpdate, sessionId, sto
       const remoteJid = msg.key?.remoteJid || "";
       const fromMe = Boolean(msg.key?.fromMe);
       const messageId = msg.key?.id || null;
-
       if (!remoteJid) continue;
+      if (sessionData && messageId && msg.messageTimestamp) {
+        if (!sessionData.recentMessageKeys) sessionData.recentMessageKeys = new Map();
+        sessionData.recentMessageKeys.delete(remoteJid);
+        sessionData.recentMessageKeys.set(remoteJid, {
+          key: msg.key, timestamp: getMessageTimestamp(msg.messageTimestamp)
+        });
+        while (sessionData.recentMessageKeys.size > 500) {
+          sessionData.recentMessageKeys.delete(sessionData.recentMessageKeys.keys().next().value);
+        }
+      }
       if (remoteJid.includes("@g.us")) { console.log("Mensagem de grupo ignorada:", remoteJid); continue; }
       if (remoteJid === "status@broadcast") continue;
 
@@ -988,7 +997,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
 
   sock.ev.on("messages.upsert", async (messageUpdate) => {
     const historySync = messageUpdate.type === "append";
-    await processIncomingOrOutgoingMessages({ messageUpdate, sessionId, storeId, historySync });
+    for (let i = 0; i < (messageUpdate.messages || []).length; i += HISTORY_BATCH_SIZE) {
+      await processIncomingOrOutgoingMessages({
+        messageUpdate: { messages: messageUpdate.messages.slice(i, i + HISTORY_BATCH_SIZE) },
+        sessionId, storeId, historySync
+      });
+      if (historySync) await new Promise((resolve) => setImmediate(resolve));
+    }
     if (historySync) scheduleHistoryCompletion(sessionId, storeId);
   });
 
@@ -996,7 +1011,13 @@ async function startWhatsAppSession({ sessionId, storeId, userId }) {
   sock.ev.on("messaging-history.set", async ({ messages = [], chats = [], isLatest, progress, syncType }) => {
     const tracker = getHistoryTracker(sessionId, storeId);
     tracker.batches += 1;
-    await processIncomingOrOutgoingMessages({ messageUpdate: { messages }, sessionId, storeId, historySync: true });
+    for (let i = 0; i < messages.length; i += HISTORY_BATCH_SIZE) {
+      await processIncomingOrOutgoingMessages({
+        messageUpdate: { messages: messages.slice(i, i + HISTORY_BATCH_SIZE) },
+        sessionId, storeId, historySync: true
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     await sendMessageToSystemWebhook({
       tipo: "sync_historico_progresso", conta_id: storeId, store_id: storeId,
       connection_type: "qr", session_id: sessionId,
@@ -1018,6 +1039,8 @@ app.get("/", (req, res) => {
     media_enabled: true,
     max_media_size_mb: MAX_MEDIA_SIZE_MB,
     lid_phone_mappings_count: lidToPhoneMap.size,
+    webhooks_pending: webhookOutbox.count(),
+    qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN),
     routes: [
@@ -1042,6 +1065,8 @@ app.get("/health", (req, res) => {
     media_enabled: true,
     max_media_size_mb: MAX_MEDIA_SIZE_MB,
     lid_phone_mappings_count: lidToPhoneMap.size,
+    webhooks_pending: webhookOutbox.count(),
+    qr_sessions_connected: [...sessions.values()].filter((item) => item.status === "conectado").length,
     official_api_enabled: Boolean(META_ACCESS_TOKEN && META_PHONE_NUMBER_ID),
     official_webhook_configured: Boolean(META_WEBHOOK_VERIFY_TOKEN)
   });
@@ -1134,7 +1159,7 @@ app.post("/messages/send", checkSecret, async (req, res) => {
     if (!jid) return res.status(400).json({ error: "Destino inválido. Informe um telefone real ou um JID @s.whatsapp.net.", code: "invalid_destination" });
 
     const result = await sessionData.sock.sendMessage(jid, { text: message });
-    console.log("Mensagem enviada pelo endpoint:", { session_id, phone, contact_jid, jid, message, result });
+    console.log("Mensagem enviada pelo endpoint:", { session_id, jid, messageId: result?.key?.id || null });
 
     return res.json({
       success: true,
@@ -1142,7 +1167,7 @@ app.post("/messages/send", checkSecret, async (req, res) => {
       message_id: result?.key?.id || null,
       from_me: result?.key?.fromMe || null,
       status: result?.status || null,
-      raw_result: result
+      raw_result: { key: result?.key || null, status: result?.status || null }
     });
   } catch (error) {
     return res.status(500).json({ error: "Erro ao enviar mensagem", details: error.message });
@@ -1197,7 +1222,7 @@ app.post("/messages/send-media", checkSecret, async (req, res) => {
       media_type,
       media_mime_type: media_mime_type || null,
       media_file_name: media_file_name || null,
-      raw_result: result
+      raw_result: { key: result?.key || null, status: result?.status || null }
     });
   } catch (error) {
     console.log("Erro ao enviar mídia:", error.message);
@@ -1522,6 +1547,11 @@ app.post("/official/messages/send-media", checkSecret, async (req, res) => {
     });
   }
 });
+
+const initialWebhookRetry = setTimeout(() => {
+  void resendPendingWebhooks().catch((e) => console.log("Retry inicial adiado", e.message));
+}, 5000);
+initialWebhookRetry.unref?.();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`WhatsApp Gateway rodando na porta ${PORT}`);
