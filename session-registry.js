@@ -72,8 +72,8 @@ export function createPersistedLidMap(authPath, maxEntries = 20000) {
     atomicJsonWrite(file, [...data.entries()]);
   }
   return {
+    get size() { return data.size; },
     get: (lid) => data.get(String(lid)),
-    size: () => data.size,
     set(lid, phone) {
       lid = String(lid);
       phone = String(phone);
