@@ -402,14 +402,15 @@ async function downloadIncomingMedia({ sock, msg, mediaInfo }) {
   };
 }
 
-async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromMe, contactIdentity, contactName, timestamp, mediaPayload }) {
+async function persistIncomingMediaDirect({ sessionId, storeId, messageId, fromMe, contactIdentity, contactName, timestamp, mediaPayload, connectionType = "qr", phoneNumberId = null }) {
   if (!mediaPayload?.media_buffer || !SYSTEM_WEBHOOK_URL || !SYSTEM_WEBHOOK_SECRET) return null;
   const initPayload = {
     tipo: "whatsapp_message",
     conta_id: storeId,
     store_id: storeId,
-    connection_type: "qr",
+    connection_type: connectionType,
     session_id: sessionId,
+    ...(phoneNumberId ? { phone_number_id: phoneNumberId } : {}),
     contact_phone: contactIdentity.contact_phone,
     contact_jid: contactIdentity.contact_jid,
     contact_lid: contactIdentity.contact_lid,
@@ -564,7 +565,7 @@ function extractOfficialMedia(message = {}) {
   };
 }
 
-async function downloadOfficialMediaAsBase64(mediaId, accessToken) {
+async function downloadOfficialMediaAsBuffer(mediaId, accessToken) {
   if (!mediaId || !accessToken) return null;
 
   const metaMediaResponse = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${mediaId}`, {
@@ -585,11 +586,13 @@ async function downloadOfficialMediaAsBase64(mediaId, accessToken) {
     throw new Error(`Erro ao baixar mídia oficial: HTTP ${fileResponse.status} ${errorText}`);
   }
 
+  const declaredBytes = Number(fileResponse.headers.get("content-length") || 0);
+  if (declaredBytes > MAX_MEDIA_SIZE_BYTES) throw new Error("Mídia oficial maior que o limite permitido");
   const buffer = Buffer.from(await fileResponse.arrayBuffer());
   if (buffer.length > MAX_MEDIA_SIZE_BYTES) throw new Error(`Mídia oficial excede o limite de ${MAX_MEDIA_SIZE_MB}MB`);
 
   return {
-    media_base64: buffer.toString("base64"),
+    media_buffer: buffer,
     media_size_bytes: buffer.length,
     media_mime_type: mediaMetadata.mime_type || fileResponse.headers.get("content-type") || null
   };
@@ -616,15 +619,38 @@ async function forwardOfficialMessage({ req, value, message, contact }) {
   const accessToken = req.headers["x-meta-access-token"] || META_ACCESS_TOKEN;
 
   let mediaPayload = {};
+  let officialStoragePath = null;
   if (officialMedia?.media_id) {
     try {
-      console.log("Mídia oficial recebida. Iniciando download:", { phoneNumberId, mediaId: officialMedia.media_id, type: message.type });
-      const downloaded = await downloadOfficialMediaAsBase64(officialMedia.media_id, accessToken);
-      mediaPayload = {
-        media_base64: downloaded?.media_base64 || null,
-        media_size_bytes: downloaded?.media_size_bytes || null,
-        media_mime_type: downloaded?.media_mime_type || officialMedia.media_mime_type || null
+      const downloaded = await downloadOfficialMediaAsBuffer(officialMedia.media_id, accessToken);
+      const mime = downloaded?.media_mime_type || officialMedia.media_mime_type || "application/octet-stream";
+      const tempMedia = {
+        media_buffer: downloaded.media_buffer,
+        media_size_bytes: downloaded.media_size_bytes,
+        media_mime_type: mime,
+        media_type: message.type,
+        media_file_name: officialMedia.media_file_name || `${message.type}-${message.id || Date.now()}`,
+        media_caption: officialMedia.media_caption
       };
+      try {
+        officialStoragePath = await persistIncomingMediaDirect({
+          sessionId: `official_${phoneNumberId || storeId}`,
+          storeId, messageId: message.id, fromMe: false,
+          contactIdentity: { contact_phone: contactPhone, contact_jid: contactPhone ? `${contactPhone}@s.whatsapp.net` : null, contact_lid: null },
+          contactName: contact?.profile?.name || null,
+          timestamp: getMetaTimestamp(message.timestamp),
+          mediaPayload: tempMedia, connectionType: "official", phoneNumberId
+        });
+      } catch (e) {
+        console.warn("Falha em upload direto de mídia oficial", { messageId: message.id, reason: e.message });
+        if (downloaded.media_size_bytes <= 8 * 1024 * 1024) {
+          mediaPayload.media_base64 = downloaded.media_buffer.toString("base64");
+        } else {
+          mediaPayload.media_download_error = `Upload direto indisponível: ${e.message}`;
+        }
+      }
+      mediaPayload.media_size_bytes = downloaded.media_size_bytes;
+      mediaPayload.media_mime_type = mime;
     } catch (error) {
       mediaPayload = { media_download_error: error.message, media_mime_type: officialMedia.media_mime_type || null };
       console.log("Erro ao baixar mídia oficial:", { mediaId: officialMedia.media_id, error: error.message });
@@ -660,6 +686,7 @@ async function forwardOfficialMessage({ req, value, message, contact }) {
     media_caption: officialMedia?.media_caption || null,
     media_size_bytes: mediaPayload.media_size_bytes || null,
     media_base64: mediaPayload.media_base64 || null,
+    media_storage_path: officialStoragePath,
     media_download_error: mediaPayload.media_download_error || null,
     media_baileys_type: null,
 
