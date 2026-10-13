@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { createSessionRegistry } from "./session-registry.js";
 
 dotenv.config();
 
@@ -25,7 +26,8 @@ const INTERNAL_WEBHOOK_PATH = "/__internal/system-webhook";
 
 // Mapeia a sessão canônica para a loja real informada pelo sistema.
 // Isso evita que o webhook devolva store_id = connection_id.
-const canonicalSessionStoreMap = new Map();
+const sessionRegistry = createSessionRegistry(process.env.AUTH_PATH || "./auth");
+const canonicalSessionStoreMap = new Map(sessionRegistry.entries().map((r) => [r.id, r.storeId]));
 
 function cleanDigits(value) {
   return String(value || "").replace(/\D/g, "");
@@ -137,7 +139,8 @@ async function startInternalServer() {
 
 const app = express();
 app.use(cors());
-app.use(express.raw({ type: "*/*", limit: "90mb" }));
+// Base64 de 100 MB pode ultrapassar 133 MB (servidor valida bytes reais).
+app.use(express.raw({ type: "*/*", limit: "145mb" }));
 
 app.post(INTERNAL_WEBHOOK_PATH, async (req, res) => {
   if (!ORIGINAL_SYSTEM_WEBHOOK_URL || !ORIGINAL_SYSTEM_WEBHOOK_SECRET) {
@@ -190,7 +193,20 @@ app.post("/sessions", checkSecret, async (req, res) => {
     });
   }
 
-  if (body.store_id) canonicalSessionStoreMap.set(canonicalSessionId, String(body.store_id));
+  const previous = sessionRegistry.get(canonicalSessionId);
+  const storeId = String(body.store_id || previous?.storeId || "");
+  if (!isUuidLike(canonicalSessionId) || !isUuidLike(storeId)) {
+    return res.status(400).json({ success: false, error: "session_id e store_id canônicos são obrigatórios" });
+  }
+  if (previous && previous.storeId !== storeId) {
+    return res.status(409).json({ success: false, error: "Sessão pertence a outra loja" });
+  }
+  try {
+    sessionRegistry.upsert({ id: canonicalSessionId, storeId, userId: body.user_id || body.userId || previous?.userId || null });
+  } catch (error) {
+    return res.status(503).json({ success: false, error: "Falha ao persistir vínculo da sessão", details: error.message });
+  }
+  canonicalSessionStoreMap.set(canonicalSessionId, storeId);
 
   const internalBody = {
     ...body,
@@ -221,12 +237,15 @@ app.delete("/sessions/:sessionId", checkSecret, async (req, res) => {
   try {
     const externalSessionId = toExternalSessionId(req.params.sessionId);
     const internalSessionId = toInternalSessionId(externalSessionId);
-    canonicalSessionStoreMap.delete(externalSessionId);
     const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(internalSessionId)}`, {
       method: "DELETE",
       headers: { "x-gateway-secret": GATEWAY_SECRET }
     });
     const data = await response.json().catch(async () => ({ raw: await response.text() }));
+    if (response.ok) {
+      sessionRegistry.remove(externalSessionId);
+      canonicalSessionStoreMap.delete(externalSessionId);
+    }
     return res.status(response.status).json(rewriteSessionFieldsToExternal(data));
   } catch (error) {
     return res.status(502).json({ success: false, error: "Erro ao remover sessão", details: error.message });
@@ -363,8 +382,48 @@ app.use(async (req, res) => {
   }
 });
 
+// Recupera sockets preservados no volume, sem excluir credenciais.
+async function restorePersistedSessions() {
+  const entries = sessionRegistry.entries();
+  console.log("Sessões QR registradas para recuperação:", entries.length);
+  for (const entry of entries) {
+    try {
+      const existing = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(toInternalSessionId(entry.id))}/status`, {
+        headers: { "x-gateway-secret": GATEWAY_SECRET }, signal: AbortSignal.timeout(5000)
+      });
+      if (existing.ok) continue;
+      if (existing.status !== 404) continue;
+      const result = await fetch(`${internalBaseUrl}/sessions`, {
+        method: "POST", headers: { "content-type": "application/json", "x-gateway-secret": GATEWAY_SECRET },
+        body: JSON.stringify({ store_id: entry.id, user_id: entry.userId }),
+        signal: AbortSignal.timeout(20000)
+      });
+      console.log("Restauração QR", { sessionId: entry.id, status: result.status });
+    } catch (error) {
+      console.log("Restauração QR adiada", { sessionId: entry.id, reason: error.message });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+}
+
+app.get("/sessions/diagnostics", checkSecret, async (_req, res) => {
+  const sessions = [];
+  for (const entry of sessionRegistry.entries()) {
+    try {
+      const response = await fetch(`${internalBaseUrl}/sessions/${encodeURIComponent(toInternalSessionId(entry.id))}/status`, {
+        headers: { "x-gateway-secret": GATEWAY_SECRET }, signal: AbortSignal.timeout(3000)
+      });
+      const data = await response.json().catch(() => ({}));
+      sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: response.ok ? data.status : "ausente", http_status: response.status });
+    } catch { sessions.push({ session_id: entry.id, store_id: entry.storeId, runtime: "indisponivel", http_status: null }); }
+  }
+  return res.json({ status: "ok", sessions });
+});
+
 await startInternalServer();
 
 app.listen(publicPort, "0.0.0.0", () => {
   console.log(`WhatsApp Gateway proxy rodando na porta ${publicPort}`);
+  const t = setTimeout(() => { void restorePersistedSessions(); }, 1500);
+  t.unref?.();
 });
