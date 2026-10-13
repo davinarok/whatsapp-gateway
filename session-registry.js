@@ -62,7 +62,7 @@ export function createPersistedLidMap(authPath, maxEntries = 20000) {
     const rows = JSON.parse(fs.readFileSync(file, "utf8"));
     if (!Array.isArray(rows)) throw new Error("Registro de LID inválido");
     for (const [lid, phone] of rows.slice(-maxEntries)) {
-      if (/^\d{5,25}$/.test(String(lid)) && /^\d{8,16}$/.test(String(phone))) data.set(String(lid), String(phone));
+      if (/^store_[0-9a-f-]{36}:\d{5,25}$/i.test(String(lid)) && /^\d{8,16}$/.test(String(phone))) data.set(String(lid), String(phone));
     }
   }
   let pending = null;
@@ -77,7 +77,7 @@ export function createPersistedLidMap(authPath, maxEntries = 20000) {
     set(lid, phone) {
       lid = String(lid);
       phone = String(phone);
-      if (!/^\d{5,25}$/.test(lid) || !/^\d{8,16}$/.test(phone)) return;
+      if (!/^store_[0-9a-f-]{36}:\d{5,25}$/i.test(lid) || !/^\d{8,16}$/.test(phone)) return;
       if (data.get(lid) === phone) return;
       data.delete(lid);
       data.set(lid, phone);
