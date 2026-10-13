@@ -1188,6 +1188,18 @@ app.post("/sessions", checkSecret, async (req, res) => {
     });
   }
 
+  // Nova tentativa explícita (botão Gerar QR / Retomar): se o WhatsApp já
+  // declarou logout definitivo, as credenciais antigas não são reutilizáveis.
+  // A limpeza acontece SOMENTE nesta chamada autenticada, nunca no auto-retry.
+  if (existingSession?.status === "deslogado") {
+    await closeSocketSafely(existingSession, false);
+    removeAuthFolder(sessionId);
+    existingSession.reconnectAttempts = 0;
+  } else if (existingSession && ["erro", "desconectado"].includes(existingSession.status)) {
+    existingSession.reconnectAttempts = 0;
+    await closeSocketSafely(existingSession, false);
+  }
+
   try {
     const sessionData = await startWhatsAppSession({ sessionId, storeId: store_id, userId: user_id || null });
     return res.json({
